@@ -1,0 +1,101 @@
+<!--
+Malformed and nested markup, parsed as browsers parse it.
+-->
+
+#### unclosed and misnested formatting
+<p>one<p>two <b>bold <i>both</b> italic</i> end
+==== expect
+<p>one</p><p>two <b>bold <i>both</i></b><i> italic</i> end</p>
+
+#### nested links
+<a href="https://a.example/">1<a href="https://b.example/">2</a>3</a>
+==== expect
+<a href="https://a.example/" target="_blank" rel="noopener noreferrer">1</a><a href="https://b.example/" target="_blank" rel="noopener noreferrer">2</a>3
+
+#### a block inside a paragraph
+<p>before<div>block</div>after</p>
+==== expect
+<p>before</p><div>block</div>after<p></p>
+
+#### lists without end tags
+<ul><li>a<li>b<ul><li>c</ul></ul>
+==== expect
+<ul><li>a</li><li>b<ul><li>c</li></ul></li></ul>
+
+#### stray end tags
+</p></div></a>text</b></li>
+==== expect
+text
+
+#### duplicate attributes keep the first
+<a href="https://example.com/" href="javascript:window.__canary=1">first</a><a href="javascript:window.__canary=1" href="https://example.com/">second</a>
+==== expect
+<a href="https://example.com/" target="_blank" rel="noopener noreferrer">first</a><a>second</a>
+
+#### unquoted attributes
+<img src=https://images.example/a.png alt=x onerror=window.__canary=1//>
+==== expect
+<img src="https://images.example/a.png" alt="x" referrerpolicy="no-referrer">
+
+#### attributes without spaces
+<a href="https://example.com/"title="x"onclick="window.__canary=1">no spaces</a>
+==== expect
+<a href="https://example.com/" target="_blank" rel="noopener noreferrer">no spaces</a>
+
+#### slash between attributes
+<img src="https://images.example/a.png"/onerror="window.__canary=1"/alt="a">
+==== expect
+<img src="https://images.example/a.png" alt="a" referrerpolicy="no-referrer">
+
+#### NUL in text
+<p>a&#0;b</p>
+==== expect
+<p>a�b</p>
+
+#### unterminated elements
+<p>open <b>never closed <a href="https://example.com/">link never closed
+==== expect
+<p>open <b>never closed <a href="https://example.com/" target="_blank" rel="noopener noreferrer">link never closed</a></b></p>
+
+#### unterminated attribute
+<p>before</p><a href="https://example.com/>broken quote</a><p>lost</p>
+==== expect
+<p>before</p>
+
+#### less-than signs in text
+<<p>>double 5 < 6 & 7 > 3 &lt;script&gt;window.__canary=1&lt;/script&gt;
+==== expect
+&lt;<p>&gt;double 5 &lt; 6 &amp; 7 &gt; 3 &lt;script&gt;window.__canary=1&lt;/script&gt;</p>
+
+#### comments
+<!-- comment --><p>after comment</p><!--><p>after abrupt comment</p>--><!--!><p>bang</p>
+==== expect
+<p>after comment</p><p>after abrupt comment</p>--&gt;
+
+#### CDATA outside foreign content
+<![CDATA[<img src=x onerror=window.__canary=1>]]><p>after</p>
+==== expect
+]]&gt;<p>after</p>
+
+#### processing instruction
+<?xml version="1.0"?><?xml-stylesheet href="/v1/read/summary"?><p>after</p>
+==== expect
+<p>after</p>
+
+#### unterminated comment
+<p>shown</p><!-- <img src=x onerror=window.__canary=1>
+==== expect
+<p>shown</p>
+
+#### a table around a link
+<a href="https://a.example/">1<table><tr><td><a href="https://b.example/">2</a></td></tr></table>3</a>
+==== expect
+<a href="https://a.example/" target="_blank" rel="noopener noreferrer">1</a><a href="https://b.example/" target="_blank" rel="noopener noreferrer">2</a>3
+
+#### deep nesting
+@depth-capped
+<div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div><div>deep 12:34</div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div></div>
+
+#### deep inline nesting
+@depth-capped
+<b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i><b><i>deep</i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b></i></b>

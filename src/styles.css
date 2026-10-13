@@ -1,0 +1,1059 @@
+/* AntennaPod 3.12.1's look (ui/common colors.xml, Material components):
+   light and dark themes, logical properties for right-to-left, and the
+   drawer as a side bar that collapses behind a menu button in narrow windows. */
+
+:root {
+  --accent: #0078c2;
+  --background: #f9fcff;
+  --surface: #ffffff;
+  --elevated: #efeeee;
+  --surface-variant: #d3dce0;
+  --secondary-container: #c8d8de;
+  --text: #000000;
+  --text-secondary: #444444;
+  --divider: rgba(0, 0, 0, 0.12);
+  --on-accent: #ffffff;
+  --drawer-width: 280px;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --accent: #3d8bff;
+    --background: #21272b;
+    --surface: #2d3337;
+    --elevated: #2d3337;
+    --surface-variant: #2f3b4f;
+    --secondary-container: #3c4e68;
+    --text: #ffffff;
+    --text-secondary: #cccccc;
+    --divider: rgba(255, 255, 255, 0.12);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  background: var(--background);
+  color: var(--text);
+  font-family: Roboto, system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 14px;
+  line-height: 1.43;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-weight: 500;
+}
+
+.secondary {
+  color: var(--text-secondary);
+}
+
+.error {
+  color: #b00020;
+}
+
+.icon {
+  display: inline-block;
+  flex: none;
+  vertical-align: middle;
+}
+
+/* ---- buttons */
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  border: 0;
+  border-radius: 50%;
+  background: none;
+  cursor: pointer;
+}
+
+.icon-button:hover,
+.icon-button:focus-visible {
+  background: var(--divider);
+}
+
+.text-button,
+.outlined-button,
+.filled-button {
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 0 16px;
+  border-radius: 20px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.text-button {
+  border: 0;
+  background: none;
+  color: var(--accent);
+}
+
+.outlined-button {
+  border: 1px solid var(--divider);
+  background: none;
+  color: var(--accent);
+}
+
+.filled-button {
+  border: 0;
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.text-button.danger {
+  color: #b00020;
+}
+
+button:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---- shell */
+
+.shell {
+  display: grid;
+  grid-template-columns: var(--drawer-width) 1fr;
+  min-height: 100vh;
+}
+
+.drawer {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+  border-inline-end: 1px solid var(--divider);
+  background: var(--surface);
+  padding-block: 8px;
+}
+
+.drawer hr {
+  border: 0;
+  border-top: 1px solid var(--divider);
+  margin-block: 8px;
+}
+
+.drawer ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-height: 48px;
+  margin-inline: 8px;
+  padding-inline: 16px;
+  border-radius: 24px;
+}
+
+.nav-item:hover {
+  background: var(--divider);
+}
+
+.nav-item.current {
+  background: var(--secondary-container);
+  font-weight: 500;
+}
+
+.nav-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nav-count {
+  color: var(--text-secondary);
+}
+
+.drawer-toggle {
+  display: none;
+}
+
+.content {
+  min-width: 0;
+  padding-bottom: 96px;
+}
+
+.banner {
+  padding: 12px 16px;
+  background: var(--surface-variant);
+}
+
+.snackbars {
+  position: fixed;
+  inset-inline-start: calc(var(--drawer-width) + 16px);
+  bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 20;
+}
+
+.snackbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 288px;
+  max-width: 560px;
+  padding: 6px 8px 6px 16px;
+  border-radius: 4px;
+  background: #323232;
+  color: #ffffff;
+}
+
+.snackbar .text-button {
+  color: #8ab4f8;
+}
+
+
+
+/* ---- screens */
+
+.toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  min-height: 56px;
+  padding-inline: 16px 4px;
+  background: var(--background);
+  border-bottom: 1px solid var(--divider);
+}
+
+.toolbar h1 {
+  flex: 1;
+  font-size: 20px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+}
+
+.toolbar-info {
+  color: var(--text-secondary);
+  margin-inline-end: 8px;
+}
+
+.menu {
+  position: relative;
+}
+
+.menu-list {
+  position: absolute;
+  inset-inline-end: 0;
+  top: 44px;
+  z-index: 25;
+  min-width: 200px;
+  margin: 0;
+  padding: 8px 0;
+  list-style: none;
+  background: var(--surface);
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.menu-list.context {
+  position: fixed;
+  inset-inline-end: auto;
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+}
+
+.menu-list button {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+  min-height: 48px;
+  padding: 0 16px;
+  border: 0;
+  background: none;
+  text-align: start;
+  align-items: center;
+  cursor: pointer;
+}
+
+.menu-list button:hover,
+.menu-list button:focus-visible {
+  background: var(--divider);
+}
+
+.menu-list .check {
+  width: 16px;
+  color: var(--accent);
+}
+
+.empty {
+  padding: 48px 32px;
+  text-align: center;
+  color: var(--text-secondary);
+}
+
+.empty h2 {
+  margin-block: 16px 8px;
+  font-size: 18px;
+  color: var(--text);
+}
+
+.loading {
+  height: 4px;
+  margin: 16px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  background-size: 50% 100%;
+  animation: loading 1.2s infinite linear;
+}
+
+@keyframes loading {
+  from {
+    background-position: -50% 0;
+  }
+  to {
+    background-position: 150% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loading {
+    animation: none;
+  }
+}
+
+/* ---- episode lists (EpisodeItemViewHolder) */
+
+.episode-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.episode {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-inline: 16px 4px;
+  border-bottom: 1px solid var(--divider);
+}
+
+.episode.played .episode-main {
+  opacity: 0.5;
+}
+
+.episode-main {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex: 1;
+  min-width: 0;
+  padding-block: 8px;
+}
+
+.episode-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.episode-title {
+  font-size: 16px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.episode-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+}
+
+.episode-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.episode-progress progress {
+  flex: 1;
+  height: 4px;
+  accent-color: var(--accent);
+}
+
+.load-more {
+  display: flex;
+  margin: 16px auto;
+}
+
+.cover {
+  flex: none;
+  border-radius: 4px;
+  object-fit: cover;
+  background: var(--elevated);
+}
+
+.cover-generated {
+  display: inline-flex;
+  align-items: flex-end;
+  overflow: hidden;
+  padding: 4px;
+  background: linear-gradient(135deg, #364ff3, #2e6ff6 25%, #1eb0fc 75%, #16d0ff);
+  color: #ffffff;
+  font-size: 10px;
+  line-height: 1.2;
+}
+
+/* ---- Home */
+
+.home-section {
+  padding: 16px;
+}
+
+.home-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.home-section-header h2 {
+  font-size: 18px;
+}
+
+.home-empty {
+  color: var(--text-secondary);
+}
+
+.carousel-row {
+  display: flex;
+  align-items: center;
+}
+
+.carousel {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  list-style: none;
+  margin: 0;
+  padding: 0 0 8px;
+  flex: 1;
+}
+
+.card {
+  flex: none;
+  width: 128px;
+}
+
+.card a {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.card progress {
+  width: 100%;
+  height: 4px;
+  accent-color: var(--accent);
+}
+
+.card-title {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* ---- Subscriptions */
+
+.subscription-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 12px;
+  list-style: none;
+  margin: 0;
+  padding: 16px;
+}
+
+.subscription-tile {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+}
+
+button.subscription-tile {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+
+.subscription-grid li.selected .subscription-tile {
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--secondary-container);
+}
+
+.select-mark {
+  position: absolute;
+  top: 8px;
+  inset-inline-start: 8px;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 2px solid #ffffff;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.3);
+  color: #ffffff;
+}
+
+.selected .select-mark {
+  top: 20px;
+  inset-inline-start: 20px;
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.subscription-grid .cover {
+  width: 100%;
+  height: auto;
+  aspect-ratio: 1;
+}
+
+.subscription-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subscription-count {
+  position: absolute;
+  top: 6px;
+  inset-inline-end: 6px;
+  min-width: 24px;
+  padding: 0 6px;
+  border-radius: 12px;
+  background: var(--accent);
+  color: var(--on-accent);
+  text-align: center;
+}
+
+/* ---- Podcast and episode */
+
+.podcast-header,
+.episode-header {
+  display: flex;
+  gap: 16px;
+  padding: 16px;
+}
+
+.podcast-header h2,
+.episode-header h2 {
+  font-size: 18px;
+  margin-block: 4px;
+}
+
+/* A title or address without spaces wraps inside the window, within Android's
+   lines: two for a podcast's title and author (feeditemlist_header), five for
+   an episode's title (feeditem_fragment). */
+.podcast-header > div,
+.episode-header > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.podcast-header h2,
+.podcast-author,
+.episode-header h2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.episode-header h2 {
+  -webkit-line-clamp: 5;
+}
+
+.podcast-description {
+  padding-inline: 16px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Show notes (Android's ShownotesWebView look). */
+.shownotes {
+  padding-inline: 16px;
+  overflow-wrap: break-word;
+}
+
+.shownotes img {
+  display: block;
+  margin: 10px auto;
+  max-width: 100%;
+  height: auto;
+}
+
+.shownotes a {
+  font-style: normal;
+  font-weight: normal;
+  color: var(--accent);
+}
+
+.shownotes button[data-timecode] {
+  font: inherit;
+  color: #669900;
+  background: none;
+  border: 0;
+  padding: 0;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.shownotes-empty {
+  text-align: center;
+  color: var(--text-secondary);
+}
+
+section > h3 {
+  padding: 16px 16px 4px;
+  font-size: 16px;
+}
+
+.episode-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+/* ---- Statistics */
+
+.tabs {
+  display: flex;
+  border-bottom: 1px solid var(--divider);
+}
+
+.tabs button {
+  flex: 1;
+  min-height: 48px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: none;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.tabs button[aria-selected="true"] {
+  border-bottom-color: var(--accent);
+  color: var(--accent);
+}
+
+.statistics-total {
+  padding: 16px;
+  text-align: center;
+}
+
+.statistics-total strong {
+  font-size: 24px;
+}
+
+.statistics-list,
+.years-list,
+.device-list,
+.feed-links {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.statistics-list a {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 16px;
+}
+
+.statistics-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.years-list li {
+  display: grid;
+  grid-template-columns: 96px 1fr auto;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+}
+
+.years-list .bar {
+  height: 12px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+/* ---- forms, dialogs, settings */
+
+.add-form,
+.settings-group,
+.sign-in form,
+.import,
+.preview {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  max-width: 640px;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--text-secondary);
+}
+
+input {
+  min-height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--divider);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+
+.device-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-block: 8px;
+  border-bottom: 1px solid var(--divider);
+}
+
+.dialog {
+  max-width: 560px;
+  border: 0;
+  border-radius: 28px;
+  padding: 24px;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.dialog::backdrop {
+  background: rgba(0, 0, 0, 0.32);
+}
+
+.dialog h2 {
+  font-size: 22px;
+  margin-bottom: 16px;
+}
+
+/* Android's authentication dialog: the username, then the password with its show button. */
+.authentication-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.password-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.password-row label {
+  flex: 1;
+  min-width: 0;
+}
+
+.show-password {
+  opacity: 0.6;
+}
+
+.show-password.shown {
+  opacity: 1;
+}
+
+.dialog-buttons {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 24px;
+}
+
+dialog[open]:not([aria-modal]) {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  z-index: 40;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+.sign-in {
+  display: flex;
+  justify-content: center;
+  padding-top: 10vh;
+}
+
+.sign-in form {
+  width: 100%;
+  max-width: 400px;
+  background: var(--surface);
+  border-radius: 16px;
+}
+
+.statistics-notice {
+  padding-inline: 16px;
+}
+
+.sort-options {
+  display: flex;
+  flex-direction: column;
+}
+
+.sort-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 48px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 24px;
+  background: none;
+  text-align: start;
+  cursor: pointer;
+}
+
+.sort-option.selected {
+  background: var(--secondary-container);
+  font-weight: 500;
+}
+
+.sort-dialog label.check-row {
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+  color: var(--text);
+  margin-top: 8px;
+}
+
+/* Multi select (Android's action mode and FloatingSelectMenu). */
+.toolbar.action-mode {
+  background: var(--surface-variant);
+}
+
+.episode.selected {
+  background: var(--secondary-container);
+}
+
+button.episode-main {
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+
+.floating-select {
+  position: fixed;
+  bottom: 80px;
+  inset-inline-start: calc(var(--drawer-width) + 16px);
+  inset-inline-end: 16px;
+  z-index: 20;
+  display: flex;
+  justify-content: safe center;
+  gap: 4px;
+  width: max-content;
+  max-width: calc(100vw - var(--drawer-width) - 32px);
+  margin-inline: auto;
+  padding: 8px;
+  overflow-x: auto;
+  border-radius: 16px;
+  background: var(--elevated);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+}
+
+.floating-select-item {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  min-width: 72px;
+  max-width: 120px;
+  padding: 8px 4px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  text-align: center;
+  cursor: pointer;
+}
+
+.floating-select-item:hover,
+.floating-select-item:focus-visible {
+  background: var(--surface-variant);
+}
+
+.floating-select-item span {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* Narrow windows: the drawer collapses behind the menu button (last, so it wins). */
+@media (max-width: 840px) {
+  .shell {
+    grid-template-columns: 1fr;
+  }
+  .drawer {
+    position: fixed;
+    inset-block: 0;
+    inset-inline-start: 0;
+    width: var(--drawer-width);
+    z-index: 30;
+    transform: translateX(-100%);
+    visibility: hidden;
+  }
+  [dir="rtl"] .drawer {
+    transform: translateX(100%);
+  }
+  .floating-select {
+    inset-inline-start: 16px;
+    max-width: calc(100vw - 32px);
+  }
+  .drawer-open .drawer {
+    transform: none;
+    visibility: visible;
+    box-shadow: 0 0 24px rgba(0, 0, 0, 0.3);
+  }
+  .drawer-toggle {
+    display: inline-flex;
+    position: fixed;
+    top: 4px;
+    inset-inline-start: 4px;
+    z-index: 31;
+  }
+  .toolbar {
+    padding-inline-start: 56px;
+  }
+  .snackbars {
+    inset-inline: 16px;
+  }
+}
+
+/* Progress while an action prepares. */
+.dialog-progress {
+  display: block;
+  width: 100%;
+  margin-top: 16px;
+}
+
+.dialog-error {
+  margin-top: 16px;
+  color: var(--error, #b3261e);
+}
+
+.working {
+  position: sticky;
+  top: 0;
+  display: block;
+  width: 100%;
+  height: 4px;
+  margin: 0;
+  z-index: 2;
+}
+
+/* ItemFragment's action buttons: icon and label, borderless. */
+.item-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 20px;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  font-weight: 500;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.item-action:hover {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+/* The service page (PROTOCOL §14): paths and commands wrap in narrow windows. */
+.server-section p,
+.server-section li {
+  overflow-wrap: anywhere;
+}

@@ -1,0 +1,82 @@
+<!--
+What a person sees: formatting, lists, links and images kept; plain-text
+notes keep their line breaks and plain-text URLs become links (Android's
+ShownotesCleaner and PlainTextLinksConverter), within the URL rules.
+-->
+
+#### plain text keeps its line breaks
+First line
+Second line
+
+Third line & more <after> a blank line
+==== expect
+First line<br>Second line<br><br>Third line &amp; more  a blank line
+
+#### line breaks are left alone when there is a br
+One<br>two
+three
+==== expect
+One<br>two
+three
+
+#### line breaks are left alone when there is a p
+<p>One</p>
+<p>Two</p>
+==== expect
+<p>One</p>
+<p>Two</p>
+
+#### an uppercase P is not a p to Android
+<P>One</P>
+Two
+==== expect
+<p>One</p><br>Two
+
+#### every allowed element
+<h1>H1</h1><h2>H2</h2><h3>H3</h3><h4>H4</h4><h5>H5</h5><h6>H6</h6><p><b>b</b> <strong>strong</strong> <i>i</i> <em>em</em> <u>u</u> <s>s</s> <span>span</span> <code>code</code></p><blockquote>quote</blockquote><ul><li>one</li></ul><ol><li>two</li></ol><hr><pre>pre  text</pre><div>div</div>
+==== expect
+<h1>H1</h1><h2>H2</h2><h3>H3</h3><h4>H4</h4><h5>H5</h5><h6>H6</h6><p><b>b</b> <strong>strong</strong> <i>i</i> <em>em</em> <u>u</u> <s>s</s> <span>span</span> <code>code</code></p><blockquote>quote</blockquote><ul><li>one</li></ul><ol><li>two</li></ol><hr><pre>pre  text</pre><div>div</div>
+
+#### elements outside the allowlist keep their text
+<table><tbody><tr><td>cell one</td><td>cell two</td></tr></tbody></table><font color="red">red</font> x<sup>2</sup> <center>centred</center> <small>small</small>
+==== expect
+cell onecell twored x2 centred small
+
+#### links open in a new tab without a referrer
+<p><a href="https://example.com/a?b=1&amp;c=2" title="t" class="c" id="i" target="_self" rel="opener">A link</a> and <a href="mailto:host@example.com">mail</a></p>
+==== expect
+<p><a href="https://example.com/a?b=1&amp;c=2" target="_blank" rel="noopener noreferrer">A link</a> and <a href="mailto:host@example.com" target="_blank" rel="noopener noreferrer">mail</a></p>
+
+#### images load without a referrer
+<p><img src="https://images.example/cover.jpg" alt="Cover" width="300" height="200" title="t" loading="lazy" decoding="async" class="c"></p>
+==== expect
+<p><img src="https://images.example/cover.jpg" alt="Cover" width="300" height="200" referrerpolicy="no-referrer"></p>
+
+#### plain-text links
+text  https://url.to/link and https://t.me/link, artist here:  www.example.com and text'https://url.to/link and=https://t.me/link
+==== expect
+text  <a href="https://url.to/link" target="_blank" rel="noopener noreferrer">https://url.to/link</a> and https://t.me/link, artist here:  <a href="https://www.example.com/" target="_blank" rel="noopener noreferrer">www.example.com</a> and text'<a href="https://url.to/link" target="_blank" rel="noopener noreferrer">https://url.to/link</a> and=<a href="https://t.me/link" target="_blank" rel="noopener noreferrer">https://t.me/link</a>
+
+#### plain-text links with query, fragment and punctuation inside
+https://t.me/link#mark?param1=1&amp;param2=true;param3=true after-text https://example.org/%D0%%86_(%D1%%BC,_2020 https://www.ietf.org/rfc/rfc3986.txt https://www.example.org/valid/-~.,$/url/ https://archive.org/web/*/https://www.example.com/
+==== expect
+<a href="https://t.me/link#mark?param1=1&amp;param2=true;param3=true" target="_blank" rel="noopener noreferrer">https://t.me/link#mark?param1=1&amp;param2=true;param3=true</a> after-text <a href="https://example.org/%D0%%86_(%D1%%BC,_2020" target="_blank" rel="noopener noreferrer">https://example.org/%D0%%86_(%D1%%BC,_2020</a> <a href="https://www.ietf.org/rfc/rfc3986.txt" target="_blank" rel="noopener noreferrer">https://www.ietf.org/rfc/rfc3986.txt</a> <a href="https://www.example.org/valid/-~.,$/url/" target="_blank" rel="noopener noreferrer">https://www.example.org/valid/-~.,$/url/</a> <a href="https://archive.org/web/*/https://www.example.com/" target="_blank" rel="noopener noreferrer">https://archive.org/web/*/https://www.example.com/</a>
+
+#### plain-text links ending in punctuation are not links
+Sign up now (https://example.com/abc)! To read on, visit https://example.com. Visit https://example.com/wiki_(url+rules) and (https://example.com/abc) and https://example.com/abc
+==== expect
+Sign up now (https://example.com/abc)! To read on, visit https://example.com. Visit https://example.com/wiki_(url+rules) and (https://example.com/abc) and <a href="https://example.com/abc" target="_blank" rel="noopener noreferrer">https://example.com/abc</a>
+
+#### plain-text http, credential and same-origin URLs are not links
+http://example.com/feed https://user:pass@example.com/feed https://nottennapod.test/v1/read/summary
+==== expect
+http://example.com/feed https://user:pass@example.com/feed https://nottennapod.test/v1/read/summary
+
+#### existing links are kept as they are
+Click <a alt="abc" href="https://url.to/link">https://url.to/link, this link</a> or <a href="https://xy.org/newlanding">our new website https://xy.org</a> - <em>01:57:01</em>
+==== expect
+Click <a href="https://url.to/link" target="_blank" rel="noopener noreferrer">https://url.to/link, this link</a> or <a href="https://xy.org/newlanding" target="_blank" rel="noopener noreferrer">our new website https://xy.org</a> - <em><button type="button" data-timecode="7021000">01:57:01</button></em>
+
+#### no notes shows the label
+==== expect
+<p>This episode has no shownotes.</p>

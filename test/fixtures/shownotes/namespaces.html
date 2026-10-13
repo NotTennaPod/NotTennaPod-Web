@@ -1,0 +1,145 @@
+<!--
+Namespace transitions (svg, math, noscript, template) and mutation-XSS
+payloads, including published DOMPurify bypasses. SVG and MathML go with
+their content; raw-text and template content never reaches the page.
+-->
+
+#### svg script
+<svg><script>window.__canary=1</script></svg><p>after</p>
+==== expect
+<p>after</p>
+
+#### svg onload
+<svg onload="window.__canary=1"><circle r="1"></circle></svg><p>after</p>
+==== expect
+<p>after</p>
+
+#### svg link
+<svg><a xlink:href="javascript:window.__canary=1" href="javascript:window.__canary=1"><text>t</text></a></svg><p>after</p>
+==== expect
+<p>after</p>
+
+#### svg foreignObject
+<svg><foreignObject><p>inside</p><img src="https://images.example/a.png" onerror="window.__canary=1"></foreignObject></svg><p>after</p>
+==== expect
+<p>after</p>
+
+#### svg style breakout
+<svg><style><img src=x onerror="window.__canary=1"></style></svg><p>after</p>
+==== expect
+<p>after</p>
+
+#### svg end-p style
+<svg></p><style><a id="</style><img src=1 onerror=window.__canary=1>">
+==== expect
+<p></p>"&gt;
+
+#### svg CDATA
+<svg><![CDATA[><img src=x onerror=window.__canary=1>]]></svg><p>after</p>
+==== expect
+<p>after</p>
+
+#### svg use
+<svg><use href="data:image/svg+xml;base64,PHN2ZyBpZD0neCcgeG1sbnM9J2h0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnJyBvbmxvYWQ9J3dpbmRvdy5fX2NhbmFyeT0xJy8+#x"></use></svg><p>after</p>
+==== expect
+<p>after</p>
+
+#### math mtext table mglyph style
+<math><mtext><table><mglyph><style><img src=x onerror="window.__canary=1">
+==== expect
+
+
+#### math form mglyph style
+<form><math><mtext></form><form><mglyph><style></math><img src onerror="window.__canary=1">
+==== expect
+
+
+#### math mi mglyph svg mtext textarea
+<math><mi><mglyph><svg><mtext><textarea><path id="</textarea><img onerror=window.__canary=1 src=1>">
+==== expect
+
+
+#### math annotation-xml
+<math><annotation-xml encoding="text/html"><style><img src=x onerror="window.__canary=1"></style></annotation-xml></math><p>after</p>
+==== expect
+<p>after</p>
+
+#### math href
+<math href="javascript:window.__canary=1"><mi>click</mi></math><p>after</p>
+==== expect
+<p>after</p>
+
+#### math style
+<math><style><img src=x onerror="window.__canary=1"></style></math><p>after</p>
+==== expect
+<p>after</p>
+
+#### noscript title breakout
+<noscript><p title="</noscript><img src=x onerror=window.__canary=1>"></noscript>
+==== expect
+<p></p>
+
+#### noscript style
+<noscript><style></noscript><img src=x onerror=window.__canary=1>
+==== expect
+
+
+#### template content
+<template><script>window.__canary=1</script><img src=x onerror="window.__canary=1"></template><p>after</p>
+==== expect
+<p>after</p>
+
+#### declarative shadow root
+<div><template shadowrootmode="open"><img src=x onerror="window.__canary=1"><p>shadow</p></template>light</div>
+==== expect
+<div>light</div>
+
+#### xmp title breakout
+<xmp><p title="</xmp><img src=x onerror=window.__canary=1>">
+==== expect
+"&gt;
+
+#### noembed title breakout
+<noembed><img title="</noembed><img src onerror=window.__canary=1>"></noembed>
+==== expect
+"&gt;
+
+#### noframes title breakout
+<noframes><p title="</noframes><img src=x onerror=window.__canary=1>">
+==== expect
+"&gt;
+
+#### iframe text breakout
+<iframe><p title="</iframe><img src=x onerror=window.__canary=1>">
+==== expect
+"&gt;
+
+#### textarea title breakout
+<textarea><p title="</textarea><img src=x onerror=window.__canary=1>">
+==== expect
+&lt;p title=""&gt;
+
+#### title in the body
+<title><img src=x onerror=window.__canary=1></title><p>after</p>
+==== expect
+<p>after</p>
+
+#### plaintext
+<p>before</p><plaintext><img src=x onerror=window.__canary=1>
+==== expect
+<p>before</p>
+
+#### svg paragraph style
+<svg><p><style><img src=x onerror=window.__canary=1></style></p></svg>
+==== expect
+<p></p>
+
+#### link inside svg inside a link
+<a href="https://example.com/"><svg><a href="javascript:window.__canary=1">x</a></svg>y</a>
+==== expect
+<a href="https://example.com/" target="_blank" rel="noopener noreferrer">y</a>
+
+#### attribute holding markup
+<img src="https://images.example/a.png" alt="</p><img src=x onerror=window.__canary=1>"><a href="https://example.com/">--><img src=x onerror=window.__canary=1></a>
+==== expect
+<img src="https://images.example/a.png" alt="&lt;/p&gt;&lt;img src=x onerror=window.__canary=1&gt;" referrerpolicy="no-referrer"><a href="https://example.com/" target="_blank" rel="noopener noreferrer">--&gt;</a>

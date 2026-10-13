@@ -1,0 +1,33 @@
+<!--
+srcset and sizes go, so an image loads only from its checked src.
+-->
+
+#### srcset to the app
+<img src="https://images.example/a.png" srcset="https://nottennapod.test/v1/read/summary 2x" alt="a">
+==== expect
+<img src="https://images.example/a.png" alt="a" referrerpolicy="no-referrer">
+
+#### srcset without src
+<img srcset="https://images.example/a.png 1x" alt="a">
+==== expect
+
+
+#### srcset with sizes
+<img src="https://images.example/a.png" sizes="100vw" srcset="/v1/read/summary 100w, /v1/events 200w" alt="a">
+==== expect
+<img src="https://images.example/a.png" alt="a" referrerpolicy="no-referrer">
+
+#### srcset in capitals
+<img src="https://images.example/a.png" SRCSET="/v1/read/summary 2x" alt="a">
+==== expect
+<img src="https://images.example/a.png" alt="a" referrerpolicy="no-referrer">
+
+#### image element is img
+<image src="https://images.example/a.png" srcset="/v1/read/summary 2x" alt="a">
+==== expect
+<img src="https://images.example/a.png" alt="a" referrerpolicy="no-referrer">
+
+#### picture source srcset
+<picture><source srcset="/v1/read/summary" type="image/webp"><source srcset="https://images.example/b.png"><img src="https://images.example/a.png" alt="a"></picture>
+==== expect
+<img src="https://images.example/a.png" alt="a" referrerpolicy="no-referrer">

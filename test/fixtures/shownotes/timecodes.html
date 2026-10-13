@@ -1,0 +1,173 @@
+<!--
+Timecodes. The first cases are Android 3.12.1's ShownotesCleanerTest, ported
+case by case; the rest cover the rest of ShownotesCleaner.addTimecodes and
+the ICU semantics of its pattern on Android.
+-->
+
+#### hh:mm:ss without media
+@timecodes 36672000=10:11:12
+<p> Some test text with a timecode 10:11:12 here.</p>
+==== expect
+<p> Some test text with a timecode <button type="button" data-timecode="36672000">10:11:12</button> here.</p>
+
+#### hh:mm:ss past 24 hours without media
+@timecodes 90000000=25:00:00
+<p> Some test text with a timecode 25:00:00 here.</p>
+==== expect
+<p> Some test text with a timecode <button type="button" data-timecode="90000000">25:00:00</button> here.</p>
+
+#### short timecode is hh:mm without media
+@timecodes 36660000=10:11
+<p> Some test text with a timecode 10:11 here.</p>
+==== expect
+<p> Some test text with a timecode <button type="button" data-timecode="36660000">10:11</button> here.</p>
+
+#### short timecode is mm:ss when hh:mm is longer than the episode
+@duration 660000
+@timecodes 611000=10:11
+<p> Some test text with a timecode 10:11 here.</p>
+==== expect
+<p> Some test text with a timecode <button type="button" data-timecode="611000">10:11</button> here.</p>
+
+#### h:mm:ss without media
+@timecodes 7872000=2:11:12
+<p> Some test text with a timecode 2:11:12 here.</p>
+==== expect
+<p> Some test text with a timecode <button type="button" data-timecode="7872000">2:11:12</button> here.</p>
+
+#### m:ss
+@duration 120000
+@timecodes 72000=1:12
+<p> Some test text with a timecode 1:12 here.</p>
+==== expect
+<p> Some test text with a timecode <button type="button" data-timecode="72000">1:12</button> here.</p>
+
+#### a timecode equal to the duration is not a link
+@duration 7872000
+@timecodes none
+<p> Some test text with a timecode 2:11:12 here.</p>
+==== expect
+<p> Some test text with a timecode 2:11:12 here.</p>
+
+#### short and long timecodes together
+@duration 7200000
+@timecodes 612000=10:12 4212000=1:10:12
+<p> Some test text with a timecode 10:12 here. Hey look another one 1:10:12 here!</p>
+==== expect
+<p> Some test text with a timecode <button type="button" data-timecode="612000">10:12</button> here. Hey look another one <button type="button" data-timecode="4212000">1:10:12</button> here!</p>
+
+#### one short timecode longer than the episode makes all mm:ss
+@duration 10800000
+@timecodes 612000=10:12 132000=2:12
+<p> Some test text with a timecode 10:12 here. Hey look another one 2:12 here!</p>
+==== expect
+<p> Some test text with a timecode <button type="button" data-timecode="612000">10:12</button> here. Hey look another one <button type="button" data-timecode="132000">2:12</button> here!</p>
+
+#### timecode in parentheses
+@timecodes 36660000=10:11
+<p> Some test text with a timecode (10:11) here.</p>
+==== expect
+<p> Some test text with a timecode (<button type="button" data-timecode="36660000">10:11</button>) here.</p>
+
+#### timecode in brackets
+@timecodes 36660000=10:11
+<p> Some test text with a timecode [10:11] here.</p>
+==== expect
+<p> Some test text with a timecode [<button type="button" data-timecode="36660000">10:11</button>] here.</p>
+
+#### timecode in angle brackets
+@timecodes 36660000=10:11
+<p> Some test text with a timecode <10:11> here.</p>
+==== expect
+<p> Some test text with a timecode &lt;<button type="button" data-timecode="36660000">10:11</button>&gt; here.</p>
+
+#### invalid timecodes
+@timecodes none
+<p> Some test text with timecodes 2:1 0:0 000 00 00:000 here.</p>
+==== expect
+<p> Some test text with timecodes 2:1 0:0 000 00 00:000 here.</p>
+
+#### unknown duration links nothing
+@duration 0
+@timecodes none
+<p>Chapters: 0:00 intro, 12:34 interview</p>
+==== expect
+<p>Chapters: 0:00 intro, 12:34 interview</p>
+
+#### timecodes past the end are not links
+@duration 1800000
+@timecodes 0=0:00 754000=12:34
+<p>0:00 Intro 12:34 Main 45:00 Outro 1:02:03 Bonus</p>
+==== expect
+<p><button type="button" data-timecode="0">0:00</button> Intro <button type="button" data-timecode="754000">12:34</button> Main 45:00 Outro 1:02:03 Bonus</p>
+
+#### word boundaries
+@timecodes 45240000=12:34 45240000=12:34
+<p>x12:34 12:34x 12:34_ é12:34 at 12:34. (12:34) 12:345</p>
+==== expect
+<p>x12:34 12:34x 12:34_ é12:34 at <button type="button" data-timecode="45240000">12:34</button>. (<button type="button" data-timecode="45240000">12:34</button>) 12:345</p>
+
+#### decimal digits of other scripts
+@timecodes 45240000=١٢:٣٤ 3723000=۱:۰۲:۰۳
+<p>Arabic-Indic ١٢:٣٤ and Persian ۱:۰۲:۰۳</p>
+==== expect
+<p>Arabic-Indic <button type="button" data-timecode="45240000">١٢:٣٤</button> and Persian <button type="button" data-timecode="3723000">۱:۰۲:۰۳</button></p>
+
+#### format characters around a timecode
+@timecodes 45240000=12:34
+<p>&#x200F;12:34 then 12:34&#x200F; then ab&#x200F;12:34</p>
+==== expect
+<p>‏<button type="button" data-timecode="45240000">12:34</button> then 12:34‏ then ab‏12:34</p>
+
+#### timecodes too large for Android's int are not links
+@timecodes none
+<p>99999999999:00 and 600:00:00</p>
+==== expect
+<p>99999999999:00 and 600:00:00</p>
+
+#### timecodes in lists and formatting
+@duration 600000
+@timecodes 0=0:00 330000=5:30
+<ul><li>0:00 Intro</li><li><strong>5:30</strong> News</li></ul>
+==== expect
+<ul><li><button type="button" data-timecode="0">0:00</button> Intro</li><li><strong><button type="button" data-timecode="330000">5:30</button></strong> News</li></ul>
+
+#### plain-text chapter list
+@duration 4000000
+@timecodes 0=0:00 754000=12:34 3723000=1:02:03
+0:00 Intro
+12:34 Interview
+1:02:03 Outro
+==== expect
+<button type="button" data-timecode="0">0:00</button> Intro<br><button type="button" data-timecode="754000">12:34</button> Interview<br><button type="button" data-timecode="3723000">1:02:03</button> Outro
+
+#### a link that is only a timecode seeks
+@timecodes 45240000=12:34
+<p><a href="https://www.youtube.com/watch?v=abc&amp;t=754s">12:34</a> Interview</p>
+==== expect
+<p><button type="button" data-timecode="45240000">12:34</button> Interview</p>
+
+#### a link around a timecode is split
+@timecodes 45240000=12:34
+<p><a href="https://example.com/ch2">Chapter 2 at 12:34 – the interview</a></p>
+==== expect
+<p><a href="https://example.com/ch2" target="_blank" rel="noopener noreferrer">Chapter 2 at </a><button type="button" data-timecode="45240000">12:34</button><a href="https://example.com/ch2" target="_blank" rel="noopener noreferrer"> – the interview</a></p>
+
+#### formatting inside a split link is kept
+@timecodes 5025000=1:23:45
+<p><a href="https://example.com/"><b>Part 1:23:45 end</b></a></p>
+==== expect
+<p><a href="https://example.com/" target="_blank" rel="noopener noreferrer"><b>Part </b></a><b><button type="button" data-timecode="5025000">1:23:45</button></b><a href="https://example.com/" target="_blank" rel="noopener noreferrer"><b> end</b></a></p>
+
+#### two timecodes in one link
+@duration 3600000
+@timecodes 61000=1:01 122000=2:02
+<p><a href="https://example.com/">1:01 one, 2:02 two</a></p>
+==== expect
+<p><button type="button" data-timecode="61000">1:01</button><a href="https://example.com/" target="_blank" rel="noopener noreferrer"> one, </a><button type="button" data-timecode="122000">2:02</button><a href="https://example.com/" target="_blank" rel="noopener noreferrer"> two</a></p>
+
+#### a timecode in a plain-text link
+@timecodes 45240000=12:34
+<p>Watch https://example.com/t/12:34 now</p>
+==== expect
+<p>Watch <a href="https://example.com/t/12:34" target="_blank" rel="noopener noreferrer">https://example.com/t/</a><button type="button" data-timecode="45240000">12:34</button> now</p>

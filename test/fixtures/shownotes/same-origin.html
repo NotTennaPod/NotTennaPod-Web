@@ -1,0 +1,90 @@
+<!--
+Relative and same-origin URLs are dropped, so show notes never make the
+browser request the app's own API (the app is https://nottennapod.test).
+Another port of the app's host is dropped too: cookies are per host.
+-->
+
+#### absolute path
+<a href="/v1/read/summary">x</a><img src="/v1/read/summary">
+==== expect
+<a>x</a>
+
+#### relative path
+<a href="v1/read/summary">x</a><img src="v1/events">
+==== expect
+<a>x</a>
+
+#### dot segments
+<a href="./x">1</a><a href="../x">2</a><img src="../v1/read/queue">
+==== expect
+<a>1</a><a>2</a>
+
+#### query and fragment only
+<a href="?q=1">1</a><a href="#top">2</a>
+==== expect
+<a>1</a><a>2</a>
+
+#### empty URL
+<a href="">x</a><img src="" alt="empty">
+==== expect
+<a>x</a>
+
+#### protocol-relative to the app
+<a href="//nottennapod.test/v1/read/summary">x</a><img src="//nottennapod.test/v1/read/summary">
+==== expect
+<a>x</a>
+
+#### protocol-relative to another host
+<a href="//evil.example/x">x</a><img src="//images.example/a.png">
+==== expect
+<a>x</a>
+
+#### the app's origin
+<a href="https://nottennapod.test/v1/read/summary">x</a><img src="https://nottennapod.test/v1/events">
+==== expect
+<a>x</a>
+
+#### the app's origin in capitals with the default port
+<a href="https://NOTTENNAPOD.TEST:443/v1/read/summary">x</a><img src="HTTPS://NotTennaPod.Test:443/v1/read/summary">
+==== expect
+<a>x</a>
+
+#### the app's host with a trailing dot
+<a href="https://nottennapod.test./v1/read/summary">x</a><img src="https://nottennapod.test./v1/read/summary">
+==== expect
+<a>x</a>
+
+#### the app's host on another port
+<a href="https://nottennapod.test:8443/v1/read/summary">x</a><img src="https://nottennapod.test:8443/v1/read/summary">
+==== expect
+<a>x</a>
+
+#### the app's host percent-encoded
+<a href="https://%6Eottennapod%2Etest/v1/read/summary">x</a><img src="https://%6Eottennapod%2Etest/v1/read/summary">
+==== expect
+<a>x</a>
+
+#### the app's host in fullwidth letters
+<a href="https://ｎｏｔｔｅｎｎａｐｏｄ.ｔｅｓｔ/v1/read/summary">x</a><img src="https://ｎｏｔｔｅｎｎａｐｏｄ.ｔｅｓｔ/v1/read/summary">
+==== expect
+<a>x</a>
+
+#### https without slashes is relative
+<a href="https:nottennapod.test/v1/read/summary">1</a><a href="https:/v1/read/summary">2</a><img src="https:v1/read/summary">
+==== expect
+<a>1</a><a>2</a>
+
+#### backslashes
+<a href="\\nottennapod.test\v1\read">1</a><img src="\\nottennapod.test\v1\read">
+==== expect
+<a>1</a>
+
+#### the app's API in a srcset
+<img src="https://images.example/a.png" srcset="/v1/read/summary 2x, https://nottennapod.test/v1/events 3x" alt="a">
+==== expect
+<img src="https://images.example/a.png" alt="a" referrerpolicy="no-referrer">
+
+#### another host is fine
+<a href="https://example.com/v1/read/summary">x</a><img src="https://images.example/a.png" alt="a">
+==== expect
+<a href="https://example.com/v1/read/summary" target="_blank" rel="noopener noreferrer">x</a><img src="https://images.example/a.png" alt="a" referrerpolicy="no-referrer">

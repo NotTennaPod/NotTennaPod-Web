@@ -1,0 +1,55 @@
+<!--
+CSS injection: style attributes and style elements go, with id and class.
+The page's CSP allows same-origin stylesheets and https: images, so only the
+sanitizer stops CSS from requesting the app's API.
+-->
+
+#### style attribute with a same-origin URL
+<p style="background:url(/v1/read/summary)">styled</p>
+==== expect
+<p>styled</p>
+
+#### style attribute with an absolute app URL
+<p style="background-image:url('https://nottennapod.test/v1/read/summary')">styled</p>
+==== expect
+<p>styled</p>
+
+#### style element first
+<style>@import url(/v1/read/summary); p { background: url(/v1/events) }</style><p>after style</p>
+==== expect
+<p>after style</p>
+
+#### style element in the body
+<p>before</p><style>body { background: url(https://nottennapod.test/v1/read/summary) }</style><p>after</p>
+==== expect
+<p>before</p><p>after</p>
+
+#### stylesheet link
+<link rel="stylesheet" href="/v1/read/summary"><p>after link</p>
+==== expect
+<p>after link</p>
+
+#### old CSS script hooks
+<div style="behavior:url(#default#time2)">a</div><span style="color:expression(window.__canary=1)">b</span><p style="--x:url(/v1/read/summary); background: var(--x)">c</p>
+==== expect
+<div>a</div><span>b</span><p>c</p>
+
+#### style inside SVG
+<svg><style>@import url(/v1/read/summary);</style></svg><p>after svg</p>
+==== expect
+<p>after svg</p>
+
+#### id and class go
+<p id="app" class="hidden" lang="en" dir="rtl" title="t" hidden>visible</p>
+==== expect
+<p>visible</p>
+
+#### style on an image
+<img src="https://images.example/a.png" style="width:1px;background:url(/v1/read/summary)" alt="a">
+==== expect
+<img src="https://images.example/a.png" alt="a" referrerpolicy="no-referrer">
+
+#### legacy background attributes
+<table background="/v1/read/summary"><tbody><tr><td background="/v1/events">cell</td></tr></tbody></table><body background="/v1/read/queue">body</body>
+==== expect
+cellbody

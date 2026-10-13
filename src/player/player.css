@@ -1,0 +1,433 @@
+/* The player in Android's look (external_player_fragment, audioplayer_fragment,
+   speed_select_dialog): a 64dp bar with a 4dp progress line, and the player
+   screen over the content. */
+
+.player-bar {
+  position: fixed;
+  bottom: 0;
+  inset-inline-start: var(--drawer-width);
+  inset-inline-end: 0;
+  z-index: 15;
+  display: flex;
+  align-items: center;
+  height: 64px;
+  padding-inline-end: 4px;
+  background: var(--surface);
+  box-shadow: 0 -1px 4px rgba(0, 0, 0, 0.2);
+}
+
+.player-bar-open {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex: 1;
+  min-width: 0;
+  height: 60px;
+  margin-bottom: 4px;
+  padding: 0;
+  border: 0;
+  background: none;
+  text-align: start;
+  cursor: pointer;
+}
+
+.player-bar-open:disabled {
+  opacity: 1;
+  cursor: default;
+}
+
+.player-bar-open .cover {
+  width: 60px;
+  height: 60px;
+  border-radius: 0;
+}
+
+.player-bar-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.player-bar-title,
+.player-bar-subtitle {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.player-bar-subtitle {
+  color: var(--text-secondary);
+}
+
+.player-bar-subtitle.error {
+  color: #b00020;
+}
+
+.player-bar .play-button {
+  width: 52px;
+  height: 52px;
+  border-radius: 8px;
+}
+
+.player-bar-progress {
+  position: absolute;
+  inset-inline: 0;
+  bottom: 0;
+  height: 4px;
+  background: var(--divider);
+}
+
+.player-bar-progress > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+/* A wide window's bar carries the player's controls (the web client's layout). */
+.player-bar-wide {
+  display: none;
+}
+
+@media (min-width: 1200px) {
+  .player-bar-wide {
+    display: flex;
+    align-items: center;
+  }
+  .player-bar-open {
+    flex: 0 1 360px;
+  }
+  .player-bar-position {
+    flex: 1;
+    gap: 12px;
+    min-width: 200px;
+    padding-inline: 16px;
+    font-variant-numeric: tabular-nums;
+  }
+  .player-bar-position input {
+    flex: 1;
+    accent-color: var(--accent);
+  }
+  .player-bar .control-button .icon {
+    width: 28px;
+    height: 28px;
+  }
+  .player-bar-progress {
+    display: none;
+  }
+}
+
+/* Android puts snackbars above the player. */
+.shell:has(.player-bar) .snackbars {
+  bottom: 80px;
+}
+
+.shell:has(.player-screen) .snackbars {
+  z-index: 33;
+}
+
+.play-button.busy {
+  animation: player-busy 1.2s infinite ease-in-out;
+}
+
+@keyframes player-busy {
+  50% {
+    opacity: 0.4;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .play-button.busy {
+    animation: none;
+    opacity: 0.6;
+  }
+}
+
+/* ---- the player screen */
+
+.player-screen {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  inset-inline-start: var(--drawer-width);
+  inset-inline-end: 0;
+  z-index: 32; /* over the narrow window's menu button, as Android's player covers the toolbar */
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  background: var(--background);
+}
+
+.player-toolbar {
+  display: flex;
+  align-items: center;
+  min-height: 56px;
+  padding-inline: 4px;
+}
+
+.player-toolbar-space {
+  flex: 1;
+}
+
+.player-content {
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 12px;
+}
+
+.player-cover {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px 16px;
+  text-align: center;
+}
+
+.player-cover .cover {
+  width: min(320px, 70vw, 40vh);
+  height: min(320px, 70vw, 40vh);
+  border-radius: 8px;
+}
+
+.player-titles {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 640px;
+}
+
+.player-title {
+  font-size: 18px;
+  overflow-wrap: anywhere;
+}
+
+.player-podcast {
+  color: var(--text-secondary);
+}
+
+.player-notes {
+  max-width: 720px;
+  margin-inline: auto;
+  padding-inline: 16px;
+}
+
+.player-notes .shownotes {
+  white-space: normal;
+}
+
+.player-controls {
+  padding-bottom: 24px;
+  border-top: 1px solid var(--divider);
+  background: var(--background);
+}
+
+.player-position {
+  display: block;
+  width: calc(100% - 16px);
+  margin: 12px 8px 0;
+  accent-color: var(--accent);
+}
+
+.player-times {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 24px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.player-length {
+  padding: 4px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.player-buttons {
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.control-button {
+  flex-direction: column;
+  width: 56px;
+  height: 64px;
+  border-radius: 12px;
+}
+
+.control-caption {
+  font-size: 12px;
+  line-height: 1;
+  color: var(--text-secondary);
+}
+
+.play-button.big {
+  width: 80px;
+  height: 80px;
+  margin-inline: 4px;
+}
+
+/* ---- speed dialog */
+
+.speed-dialog {
+  width: min(480px, calc(100vw - 32px));
+}
+
+.speed-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.speed-header h2 {
+  margin-bottom: 0;
+  font-size: 16px;
+}
+
+.speed-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-block: 8px;
+}
+
+.speed-bar input {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--accent);
+}
+
+.speed-presets-title {
+  margin-bottom: 8px;
+  font-size: 16px;
+}
+
+.speed-presets {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--divider);
+  border-radius: 8px;
+  background: none;
+  cursor: pointer;
+}
+
+.chip.selected {
+  background: var(--secondary-container);
+}
+
+@media (max-width: 840px) {
+  .player-bar,
+  .player-screen {
+    inset-inline-start: 0;
+  }
+}
+
+@media (max-width: 400px) {
+  .player-buttons {
+    gap: 2px;
+  }
+  .control-button {
+    width: 48px;
+  }
+  .play-button.big {
+    margin-inline: 0;
+  }
+}
+
+/* ---- chapters (CoverFragment's chapter button, ChaptersFragment) */
+
+.chapter-control {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 150px;
+  margin: 8px auto 0;
+  padding: 0 4px;
+  border: 1px solid var(--divider);
+  border-radius: 8px;
+}
+
+.chapter-label {
+  flex: 1;
+  border: 0;
+  background: none;
+  color: var(--text-secondary, inherit);
+  font: inherit;
+  padding: 8px;
+  cursor: pointer;
+}
+
+.chapters-dialog {
+  width: min(560px, 100vw - 32px);
+}
+
+.chapter-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 60vh;
+  overflow: auto;
+}
+
+.chapter {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px;
+  border-radius: 8px;
+}
+
+.chapter.current {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.chapter-image {
+  width: 48px;
+  height: 48px;
+  border-radius: 4px;
+  object-fit: cover;
+}
+
+.chapter-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.chapter-link {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The current chapter's progress as a ring around its button. */
+.chapter-play {
+  position: relative;
+}
+
+.chapter-play::before {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border-radius: 50%;
+  background: conic-gradient(var(--accent) var(--chapter-progress, 0%), transparent 0);
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 3px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 3px));
+  pointer-events: none;
+}
