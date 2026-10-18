@@ -7,6 +7,9 @@ import type { IconName } from "../generated/icons.ts";
 import { Icon } from "./Icon.tsx";
 import { failureText, track } from "./progress.ts";
 import { useValue } from "../app/useView.ts";
+import { useSync } from "../app/context.ts";
+import { refreshesOf } from "../app/refresh.ts";
+import { w } from "../i18n.ts";
 import { ActionModeBar, actionMode } from "./selection.tsx";
 
 export function Toolbar({ title, children }: { title: string; children?: ComponentChildren }) {
@@ -172,10 +175,11 @@ export function Empty({ icon, title, text }: { icon: IconName; title: string; te
  * progress, until it is journaled; the caller closes it then. A failure is
  * shown in the dialog.
  */
-export function Confirm({ title, message, confirm, onConfirm, onCancel }: {
+export function Confirm({ title, message, confirm, dismiss, onConfirm, onCancel }: {
   title: string;
   message: string;
   confirm?: string;
+  dismiss?: string;
   onConfirm: () => void | Promise<void>;
   onCancel: () => void;
 }) {
@@ -217,13 +221,80 @@ export function Confirm({ title, message, confirm, onConfirm, onCancel }: {
       )}
       <div class="dialog-buttons">
         <button class="text-button" onClick={onCancel} disabled={busy}>
-          {t("cancel_label")}
+          {dismiss ?? t("cancel_label")}
         </button>
         <button class="text-button" onClick={() => void run()} disabled={busy}>
           {confirm ?? t("confirm_label")}
         </button>
       </div>
     </dialog>
+  );
+}
+
+/**
+ * ChoiceDialog is Android's single-choice dialog (MaterialAlertDialogBuilder's
+ * setSingleChoiceItems): a title, one choice per row, Cancel; picking a choice
+ * applies it and closes.
+ */
+export function ChoiceDialog({ title, choices, value, onChoose, onClose }: {
+  title: string;
+  choices: [string, string][];
+  value: string;
+  onChoose: (value: string) => void;
+  onClose: () => void;
+}) {
+  const ref = useRef<HTMLDialogElement>(null);
+  useEffect(() => ref.current?.showModal(), []);
+  return (
+    <dialog ref={ref} class="dialog choice-dialog" aria-labelledby="choice-title" onCancel={onClose} onClose={onClose}>
+      <h2 id="choice-title">{title}</h2>
+      <div class="choice-options" role="radiogroup" aria-labelledby="choice-title">
+        {choices.map(([v, label]) => (
+          <label key={v} class="check-row">
+            <input
+              type="radio"
+              name="choice"
+              checked={v === value}
+              // A click (or Space) on any choice, the chosen one too, closes the dialog, as Android's does;
+              // only another choice is written.
+              onClick={() => {
+                if (v !== value) onChoose(v);
+                onClose();
+              }}
+            />
+            {label}
+          </label>
+        ))}
+      </div>
+      <div class="dialog-buttons">
+        <button class="text-button" onClick={onClose}>
+          {t("cancel_label")}
+        </button>
+      </div>
+    </dialog>
+  );
+}
+
+/** refreshItem is Android's refresh_item: Refresh, of every podcast kept updated or (podcastId) of one. */
+export function refreshItem(owner: object, podcastId?: string): MenuItem {
+  return { label: t("refresh_label"), run: () => refreshesOf(owner).request(podcastId) };
+}
+
+/**
+ * RefreshBar is the list-top progress of the refreshes this browser asked for
+ * (Android's swipe-refresh spinner): how many of their podcasts are done,
+ * until the server has answered every one, also when nothing changed.
+ */
+export function RefreshBar() {
+  const progress = useValue(refreshesOf(useSync()).progress);
+  if (!progress) return null;
+  const many = progress.total > 1;
+  const text = many ? w("refreshing_count", progress.done, progress.total) : w("refreshing_podcasts");
+  return (
+    <div class="refreshing" role="status">
+      {many ? <progress max={progress.total} value={progress.done} aria-label={text} /> : <progress aria-label={text} />}
+      <span dir="auto">{text}</span>
+    </div>
   );
 }
 

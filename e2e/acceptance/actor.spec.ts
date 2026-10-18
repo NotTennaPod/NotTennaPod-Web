@@ -5,9 +5,13 @@
 // only through the actor's readings, and every reading against the server.
 import { expect, test } from "@playwright/test";
 import { spawn, type ChildProcess } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { w } from "../../src/i18n.ts";
+import { t, w } from "../../src/i18n.ts";
 import { root, serverRepo } from "../support/build.ts";
 import { startPublisher, type Publisher } from "../support/player.ts";
 import { startFeeds, startServer, type Feeds, type RunningServer } from "../support/server.ts";
@@ -374,6 +378,79 @@ test("import: an Android backup into an empty account, its Inbox, and that accou
   // Another account's diagnostics are the administrator's only.
   const ownerAccount = (await oracle.get("/v1/read/summary")).account_id as string;
   expect(await actor.fails("diagnostics", "w3", { account: ownerAccount })).toMatchObject({ code: "api_error", status: 403 });
+});
+
+test("import: an upload the server refuses reads as an error with the screen's text", async () => {
+  // The owner's account already has a library, so the server refuses to reserve an import into it.
+  const dir = mkdtempSync(join(tmpdir(), "ntp-actor-"));
+  try {
+    const file = join(dir, "subscriptions.opml");
+    writeFileSync(file, `<?xml version="1.0"?><opml version="2.0"><head><title>Subscriptions</title></head><body><outline type="rss" text="Show" xmlUrl="${feeds.url}"/></body></opml>`);
+    const refused = {
+      state: "error",
+      text: `${t("import_error_label")}: This account already has a library, so an import would overwrite or mix it. Import into a new, empty account instead.`,
+    };
+    expect(await actor.ok("import", "w1", { file })).toEqual(refused);
+    expect(await actor.ok("import_result", "w1")).toEqual(refused);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("lists longer than the screen holds: the Inbox read whole and in order, again on the same screen, and an episode deep in its podcast", async () => {
+  // More than the 400 rows a list holds at once: paging on lets go of the rows furthest above.
+  const count = 601;
+  let published = 1;
+  const day = 86_400_000;
+  const rss = () =>
+    `<?xml version="1.0"?><rss version="2.0"><channel><title>Long Show</title><link>https://example.com/</link>${Array.from(
+      { length: published },
+      (_, i) => `<item><title>Long episode ${i}</title><guid>long-${i}</guid><pubDate>${new Date(Date.UTC(2012, 0, 1) + i * day).toUTCString()}</pubDate>
+<enclosure url="https://media.example/long-${i}.mp3" length="1000" type="audio/mpeg"/></item>`,
+    ).join("")}</channel></rss>`;
+  const long = createServer((_req, res) => {
+    res.writeHead(200, { "Content-Type": "application/rss+xml" });
+    res.end(rss());
+  });
+  await new Promise<void>((r) => long.listen(0, "127.0.0.1", r));
+  try {
+    const third = { username: "third", password: "a third horse battery" };
+    await oracle.post("/v1/admin/accounts", third);
+    await actor.ok("open", "w4", { base_url: server.base });
+    await actor.ok("log_in", "w4", third);
+    const sub = await actor.ok("subscribe", "w4", { feed_url: `http://127.0.0.1:${(long.address() as AddressInfo).port}/long.xml` });
+    const reader = await new Server(server.base).logIn(third.username, third.password);
+    // The feed publishes the rest; the server's refresh files them in the Inbox.
+    published = count;
+    await reader.post("/v1/refresh", { podcast_id: sub.podcast_id });
+    await expect.poll(async () => (await reader.get("/v1/read/summary")).counters.inbox, { timeout: 120_000 }).toBeGreaterThan(400);
+    const all = async (path: string) => {
+      const ids: string[] = [];
+      let token = "";
+      do {
+        const page = await reader.get(`${path}?limit=100${token ? `&page_token=${encodeURIComponent(token)}` : ""}`);
+        ids.push(...(page.items as { episode_id: string }[]).map((e) => e.episode_id));
+        token = page.next_page_token ?? "";
+      } while (token);
+      return ids;
+    };
+    const inbox = await all("/v1/read/inbox");
+    const counters = (await reader.get("/v1/read/summary")).counters;
+    expect(inbox).toHaveLength(counters.inbox);
+
+    const read = await actor.ok("inbox", "w4");
+    expect(read.episodes.map((e: { episode_id: string }) => e.episode_id)).toEqual(inbox);
+    expect(read.counters).toEqual(counters);
+    // Read again on the screen as the first reading left it: paged to its end.
+    expect((await actor.ok("inbox", "w4")).episodes.map((e: { episode_id: string }) => e.episode_id)).toEqual(inbox);
+
+    // The podcast's oldest episode is its last row, past the rows its screen holds at once.
+    const episodes = await all(`/v1/read/podcasts/${encodeURIComponent(sub.podcast_id)}/episodes`);
+    expect(episodes).toHaveLength(count);
+    expect(await actor.ok("episode", "w4", { episode: episodes.at(-1) })).toMatchObject({ episode_id: episodes.at(-1), title: "Long episode 0" });
+  } finally {
+    await new Promise<void>((r) => long.close(() => r()));
+  }
 });
 
 test("faults: a push held while its tab closes, while its renderer crashes, lost on its way, and its answer lost", async () => {

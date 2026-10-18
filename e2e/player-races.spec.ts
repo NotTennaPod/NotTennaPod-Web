@@ -4,6 +4,7 @@
 // stays paused; the previous episode's late end status never ends the next one.
 import { expect, test, type BrowserContext, type Page } from "@playwright/test";
 import { startServer, type RunningServer } from "./support/server.ts";
+import { notNow } from "./support/offer.ts";
 import { startPublisher, type Publisher, type FixtureEpisode } from "./support/player.ts";
 
 test.describe.configure({ mode: "serial" });
@@ -108,6 +109,7 @@ test("set up and subscribe", async () => {
   await page.getByLabel("Password").fill("correct horse battery");
   await page.getByRole("button", { name: "Create account" }).click();
   await expect(page.locator("nav.drawer")).toBeVisible();
+  await notNow(page);
   await page.goto(server.base + "/add");
   await page.getByLabel("Add podcast by RSS address").fill(publisher.feedURL);
   await page.getByRole("button", { name: "Episodes preview" }).click();

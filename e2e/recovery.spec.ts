@@ -8,6 +8,7 @@ import type { AddressInfo } from "node:net";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { startServer, type RunningServer } from "./support/server.ts";
+import { notNow } from "./support/offer.ts";
 
 const user = "owner";
 const password = "correct horse battery";
@@ -51,6 +52,7 @@ test("a change acknowledged after the backup comes back after a restore, with it
     await page.getByLabel("Password").fill(password);
     await page.getByRole("button", { name: "Create account" }).click();
     await expect(page.locator("nav.drawer")).toBeVisible();
+    await notNow(page);
     await page.goto(server.base + "/add");
     await page.getByLabel("Add podcast by RSS address").fill(feedURL);
     await page.getByRole("button", { name: "Episodes preview" }).click();
@@ -148,6 +150,7 @@ test("a change no upload request can carry back stays in this browser, and Diagn
     await page.getByLabel("Password").fill(password);
     await page.getByRole("button", { name: "Create account" }).click();
     await expect(page.locator("nav.drawer")).toBeVisible();
+    await notNow(page);
     await page.goto(server.base + "/add");
     await page.getByLabel("Add podcast by RSS address").fill(feedURL);
     await page.getByRole("button", { name: "Episodes preview" }).click();

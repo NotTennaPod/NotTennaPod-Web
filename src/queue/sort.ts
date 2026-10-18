@@ -2,7 +2,7 @@
 // internal/queue): Android 3.12.1's queue comparators on canonical values,
 // stable over the current order, and re-keying that keeps the longest
 // increasing run of existing keys.
-import { between, compareKeys, type QueueKey } from "./keys.ts";
+import { between, compareKeys, keyOrder, type QueueKey } from "./keys.ts";
 
 export interface Item {
   episode_id: string;
@@ -168,29 +168,54 @@ export function rekey<T>(sorted: Placed<T>[], newID: () => { id: string; u: bigi
 }
 
 function lis<T>(ps: Placed<T>[]): boolean[] {
-  const n = ps.length;
+  return longestRun(ps.map((p) => p.key ?? null)).keep;
+}
+
+/**
+ * longestRun marks the lexicographically first (by position) longest
+ * strictly increasing run of keys, members without one never kept (PROTOCOL
+ * §7.6, as the server keeps it), with the number of key comparisons made.
+ * From the right, each keyed member's longest run starting there is one more
+ * than the longest among those after it starting above its key: the greatest
+ * key starting a run of each length decreases with the length, so a binary
+ * search finds it (O(n log n), not every pair). Then from the left, each
+ * kept member is the earliest that still allows a longest run and is above
+ * the last kept one. Keys compare as order strings built once each.
+ */
+export function longestRun(keys: (QueueKey | null)[]): { keep: boolean[]; comparisons: number } {
+  const n = keys.length;
   const keep = new Array<boolean>(n).fill(false);
-  if (n === 0) return keep;
-  const from = new Array<number>(n).fill(1);
+  const order = keys.map((k) => (k ? keyOrder(k) : ""));
+  const from = new Array<number>(n).fill(0);
+  const best: string[] = []; // best[l]: the greatest key starting a run of length l + 1 after i; decreasing
+  let comparisons = 0;
   let longest = 0;
   for (let i = n - 1; i >= 0; i--) {
-    if (!ps[i]!.key) {
-      from[i] = 0;
-      continue;
+    if (!keys[i]) continue;
+    const o = order[i]!;
+    let lo = 0;
+    let hi = best.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      comparisons++;
+      if (best[mid]! <= o) hi = mid;
+      else lo = mid + 1;
     }
-    for (let j = i + 1; j < n; j++) {
-      if (ps[j]!.key && compareKeys(ps[i]!.key!, ps[j]!.key!) < 0 && from[j]! + 1 > from[i]!) from[i] = from[j]! + 1;
-    }
-    longest = Math.max(longest, from[i]!);
+    from[i] = lo + 1;
+    best[lo] = o;
+    longest = Math.max(longest, lo + 1);
   }
   let need = longest;
   let last = -1;
   for (let i = 0; i < n && need > 0; i++) {
-    if (from[i] === need && (last < 0 || compareKeys(ps[last]!.key!, ps[i]!.key!) < 0)) {
-      keep[i] = true;
-      last = i;
-      need--;
+    if (!keys[i] || from[i] !== need) continue;
+    if (last >= 0) {
+      comparisons++;
+      if (order[last]! >= order[i]!) continue;
     }
+    keep[i] = true;
+    last = i;
+    need--;
   }
-  return keep;
+  return { keep, comparisons };
 }

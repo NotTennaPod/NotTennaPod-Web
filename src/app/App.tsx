@@ -3,7 +3,7 @@
 // one (PROTOCOL §12).
 import { useEffect, useState } from "preact/hooks";
 import { w } from "../i18n.ts";
-import { handlers } from "../api/http.ts";
+import { get, handlers } from "../api/http.ts";
 import { boot, onAccountTransition, signOut, type BootResult } from "./boot.ts";
 import { SyncContext } from "./context.ts";
 import { useRoute, type Route } from "./router.ts";
@@ -20,6 +20,43 @@ import { Statistics } from "../screens/Statistics.tsx";
 import { AddPodcast } from "../screens/AddPodcast.tsx";
 import { Settings } from "../screens/Settings.tsx";
 import { leavePlayer, startPlayer, stopPlayer } from "../player/instance.ts";
+import { RecoveryKeyDialog } from "../ui/RecoveryKeyDialog.tsx";
+import { detach as detachImport } from "./importJob.ts";
+import { offerState, recoveryKeySaved, setOffer, settleOffer } from "../ui/recoveryKey.ts";
+
+/**
+ * RecoveryKeyOffer offers to save the recovery key once after setup in this
+ * browser (PROTOCOL §11.1): to an administrator, while the server has none.
+ * "Not now" ends the offer; Settings keeps the action and its warning.
+ */
+function RecoveryKeyOffer({ sync }: { sync: Sync }) {
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    if (offerState() !== "pending" || !sync.session.account.is_admin) return;
+    let live = true;
+    get<{ keys_exported_at: number }>("/v1/admin/service").then(
+      (r) => live && setOpen(settleOffer(true, r.keys_exported_at ?? 0)),
+      () => {}, // asked again at the next page load
+    );
+    return () => {
+      live = false;
+    };
+  }, [sync]);
+  if (!open) return null;
+  return (
+    <RecoveryKeyDialog
+      offer
+      onClose={() => {
+        setOffer("done");
+        setOpen(false);
+      }}
+      onSaved={() => {
+        setOpen(false);
+        recoveryKeySaved(sync);
+      }}
+    />
+  );
+}
 
 function Screen({ route }: { route: Route }) {
   switch (route.name) {
@@ -44,7 +81,9 @@ function Screen({ route }: { route: Route }) {
     case "settings":
       return <Settings />;
     case "podcast":
-      return <Podcast id={route.id} />;
+      // One podcast per screen: another podcast (Back, Forward, a link) starts a new one, so nothing
+      // open on the last one (its dialogs, its selection) carries over.
+      return <Podcast key={route.id} id={route.id} />;
     case "episode":
       return <Episode id={route.id} />;
     default:
@@ -60,6 +99,8 @@ let leaving = false;
 function reloadAfterLeaving(): void {
   if (leaving) return;
   leaving = true;
+  // The import's job stops without a word, its unload prompt with it: the reload is the account's.
+  detachImport();
   void leavePlayer(current).finally(() => location.reload());
 }
 
@@ -116,6 +157,7 @@ export function App() {
       <Shell route={route}>
         <Screen route={route} />
       </Shell>
+      <RecoveryKeyOffer sync={sync} />
     </SyncContext.Provider>
   );
 }

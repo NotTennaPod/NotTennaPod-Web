@@ -3,18 +3,18 @@
 // actions; paged from a materialized view (PROTOCOL §12).
 import type { ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
-import { t } from "../i18n.ts";
+import { t, w } from "../i18n.ts";
 import type { EpisodeRow, ListPage } from "../api/views.ts";
 import { ApiError } from "../api/http.ts";
 import { useSync } from "../app/context.ts";
 import { linkProps, pathOf } from "../app/router.ts";
-import { useView } from "../app/useView.ts";
 import { Cover } from "./Cover.tsx";
 import { Icon } from "./Icon.tsx";
 import { contextPoint, Loading, Menu, type MenuItem, type MenuPoint } from "./components.tsx";
-import { bulkActions, SelectActions, useSelection, type QueueContext, type Selection } from "./selection.tsx";
+import { bulkActions, SelectActions, useListSelection, type QueueContext, type Selection } from "./selection.tsx";
 import { actionsFor } from "./episodeActions.ts";
 export { usePaged } from "./paged.ts";
+import type { ListWindow } from "./paged.ts";
 import { ItemButton } from "./ItemButton.tsx";
 import { durationLong, formatAbbrev } from "./format.ts";
 
@@ -56,6 +56,7 @@ export function EpisodeItem({ e, where, leading, selection }: {
   if (selection) items.push({ label: t("multi_select"), run: () => selection.start(e.episode_id) });
   return (
     <li
+      data-id={e.episode_id}
       class={`episode${e.play_state === "played" ? " played" : ""}${selected ? " selected" : ""}`}
       onContextMenu={(ev) => {
         if (selecting) return; // Android shows no row menu while selecting
@@ -108,8 +109,11 @@ export function EpisodeItem({ e, where, leading, selection }: {
 /**
  * EpisodeList is a paged episode list. Given `select`, it can select, and
  * shows the floating actions for the selection (Android's multi select).
+ * Given `window`, the rows are a window of the list: a spacer stands for the
+ * rows above it, which load as they come into sight (or by Load previous
+ * page), and the list holds still while a selection is made.
  */
-export function EpisodeList({ items, where, hasMore, loadMore, loading, empty, select }: {
+export function EpisodeList({ items, where, hasMore, loadMore, loading, empty, select, window: win }: {
   items: EpisodeRow[] | undefined;
   where?: "history" | "queue" | "inbox";
   hasMore: boolean;
@@ -117,43 +121,100 @@ export function EpisodeList({ items, where, hasMore, loadMore, loading, empty, s
   loading: boolean;
   empty: ComponentChildren;
   select?: { total: number; all: () => Promise<EpisodeRow[]>; queue?: QueueContext };
+  window?: ListWindow;
 }) {
   const sync = useSync();
-  const selection = useSelection(items, select?.total ?? 0);
+  const selection = useListSelection(items, select?.total ?? 0, win);
   // With nothing selected, the actions stay as they were (onPrepareMenu leaves them), and say so when used.
   const shownActions = useRef<ReturnType<typeof bulkActions>>([]);
   if (select && selection.active && selection.count > 0) shownActions.current = bulkActions(sync, selection.selected, select.queue);
+  // Home and End on a windowed list: one read of the rows there, not a walk through the rows between.
+  const edges = useRef(win);
+  edges.current = win;
+  useEffect(() => {
+    const key = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || (e.key !== "Home" && e.key !== "End")) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+      if (document.querySelector("dialog[open], [role=menu]")) return;
+      if (edges.current?.toEdge(e.key === "Home" ? "top" : "end")) e.preventDefault();
+    };
+    document.addEventListener("keydown", key);
+    return () => document.removeEventListener("keydown", key);
+  }, []);
   if (!items) return loading ? <Loading /> : null;
-  if (items.length === 0) return <>{empty}</>;
+  if (items.length === 0 && !win?.offset) return <>{empty}</>;
   return (
     <>
-      <ul class="episode-list">
+      {win && win.offset > 0 && (
+        <>
+          <Spacer win={win} />
+          <LoadMore onLoad={win.loadPrevious} label={w("load_previous_page_label")} observe={false} />
+        </>
+      )}
+      <ul class="episode-list" ref={win?.ref}>
         {items.map((e) => (
           <EpisodeItem key={e.episode_id} e={e} where={where} selection={select ? selection : undefined} />
         ))}
       </ul>
       {hasMore && <LoadMore onLoad={loadMore} />}
+      {win && win.below > 0 && <Spacer win={win} below />}
       {select && selection.active && (
-        <SelectActions sync={sync} selection={selection} items={items} all={select.all} actions={shownActions.current} />
+        <SelectActions sync={sync} selection={selection} all={select.all} actions={shownActions.current} />
       )}
     </>
   );
 }
 
-/** LoadMore loads the next page when it scrolls into view, or when pressed. */
-export function LoadMore({ onLoad }: { onLoad: () => void }) {
+/**
+ * Spacer stands for the rows above a window, or (`below`) the rows below it,
+ * by the row height measured: whenever scrolling brings it into sight, the
+ * rows there load.
+ */
+function Spacer({ win, below = false }: { win: ListWindow; below?: boolean }) {
+  const [el, setEl] = useState<HTMLDivElement | null>(null);
+  const latest = useRef(win);
+  latest.current = win;
+  // The list knows its spacer as soon as it is in the page (before its layout effects run).
+  const ref = useRef((e: HTMLDivElement | null) => {
+    if (below) latest.current.spacerBelow(e);
+    else latest.current.spacer(e);
+    setEl(e);
+  }).current;
+  useEffect(() => {
+    if (!el) return;
+    let frame = 0;
+    const check = () => {
+      frame = 0;
+      const r = el.getBoundingClientRect();
+      if (r.bottom > 0 && r.top < window.innerHeight) (below ? latest.current.loadBelow : latest.current.loadPrevious)();
+    };
+    const scrolled = () => {
+      if (!frame) frame = requestAnimationFrame(check);
+    };
+    window.addEventListener("scroll", scrolled, { passive: true });
+    return () => {
+      window.removeEventListener("scroll", scrolled);
+      if (frame) cancelAnimationFrame(frame);
+    };
+  }, [el]);
+  return <div ref={ref} class={below ? "list-spacer-below" : "list-spacer"} aria-hidden="true" style={{ height: `${below ? win.below : win.spacerHeight}px` }} />;
+}
+
+/** LoadMore loads the next page when it scrolls into view (unless `observe` is false), or when pressed. */
+export function LoadMore({ onLoad, label, observe = true }: { onLoad: () => void; label?: string; observe?: boolean }) {
   const [el, setEl] = useState<HTMLButtonElement | null>(null);
   useEffect(() => {
-    if (!el || typeof IntersectionObserver === "undefined") return;
+    if (!observe || !el || typeof IntersectionObserver === "undefined") return;
     const io = new IntersectionObserver((entries) => {
       if (entries.some((x) => x.isIntersecting)) onLoad();
     });
     io.observe(el);
     return () => io.disconnect();
-  }, [el, onLoad]);
+  }, [el, onLoad, observe]);
   return (
     <button ref={setEl} class="text-button load-more" onClick={onLoad}>
-      {t("load_next_page_label")}
+      {label ?? t("load_next_page_label")}
     </button>
   );
 }

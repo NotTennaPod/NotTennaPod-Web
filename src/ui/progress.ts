@@ -2,6 +2,7 @@
 // the action is journaled, and a failure says so. Nothing says an action is done before its
 // entry commits.
 import { ApiError, Unreachable } from "../api/http.ts";
+import { FactTooLarge } from "../journal/journal.ts";
 import { web } from "../webStrings.ts";
 
 type Listener = () => void;
@@ -29,6 +30,7 @@ export function reportFailuresTo(fn: (text: string) => void): void {
 
 export function failureText(e: unknown): string {
   if (e instanceof Unreachable) return web.server_unreachable;
+  if (e instanceof FactTooLarge) return web.too_large_change;
   if (e instanceof ApiError || e instanceof Error) return e.message;
   return String(e);
 }

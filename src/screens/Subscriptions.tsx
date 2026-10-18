@@ -7,11 +7,12 @@ import { useSync } from "../app/context.ts";
 import { linkProps, pathOf } from "../app/router.ts";
 import { Cover } from "../ui/Cover.tsx";
 import { Icon } from "../ui/Icon.tsx";
-import { Confirm, contextPoint, Empty, Menu, Toolbar, type MenuItem, type MenuPoint } from "../ui/components.tsx";
+import { ChoiceDialog, Confirm, contextPoint, Empty, Menu, RefreshBar, Toolbar, refreshItem, type MenuItem, type MenuPoint } from "../ui/components.tsx";
 import { KeepUpdatedDialog, RemoveFeedDialog, removeAllInbox } from "../ui/podcastDialogs.tsx";
-import { SelectActions, useSelection, type BulkAction } from "../ui/selection.tsx";
+import { SelectActions, useListSelection, type BulkAction } from "../ui/selection.tsx";
 import { LoadMore, usePaged } from "../ui/EpisodeList.tsx";
 import { useLocalSetting } from "../ui/settings.ts";
+import { failure, tileName } from "../ui/feedStatus.ts";
 
 const idOf = (p: PodcastRow) => p.podcast_id;
 
@@ -38,13 +39,16 @@ export function Subscriptions() {
   const [counter, setCounter] = useLocalSetting("feed_counter", "new");
   const [state, setState] = useLocalSetting("feed_state", "subscribed");
   const [filter, setFilter] = useLocalSetting("feed_filter", "");
-  const list = usePaged((q, s) => reads.subscriptions({ ...q, order, counter, state, filter }, s), [order, counter, state, filter]);
-  const orders: MenuItem[] = [
+  // Subscriptions have no anchored windows: a re-read reads the podcasts held.
+  const list = usePaged((q, s) => reads.subscriptions({ ...q, order, counter, state, filter }, s), [order, counter, state, filter], { idOf, anchored: false });
+  // Android's FeedSortDialog: the orders as a single choice.
+  const orders: [string, string][] = [
     ["counter", t("drawer_feed_order_unplayed_episodes")],
     ["alphabetical", t("drawer_feed_order_alphabetical")],
     ["most_recent_episode", t("drawer_feed_order_last_update")],
     ["most_played", t("drawer_feed_order_most_played")],
-  ].map(([v, label]) => ({ label: label!, checked: order === v, run: () => setOrder(v!) }));
+  ];
+  const [sorting, setSorting] = useState(false);
   const counters: MenuItem[] = [
     ["new", t("drawer_feed_counter_inbox")],
     ["unplayed", t("drawer_feed_counter_unplayed")],
@@ -61,7 +65,8 @@ export function Subscriptions() {
   const sync = useSync();
   const [menu, setMenu] = useState<{ id: string; at: MenuPoint } | null>(null);
   const [dialog, setDialog] = useState<{ kind: "remove" | "keep" | "inbox"; podcasts: PodcastRow[] } | null>(null);
-  const selection = useSelection(list.items, list.total, idOf);
+  // The grid holds still while a selection is made; a view that expires ends it.
+  const selection = useListSelection(list.items, list.total, list.window, idOf);
   const shownActions = useRef<BulkAction<PodcastRow>[]>([]);
   if (selection.active && selection.count > 0) shownActions.current = podcastActions(selection.selected, setDialog);
   const podcastMenu = (p: PodcastRow): MenuItem[] => [
@@ -74,18 +79,22 @@ export function Subscriptions() {
     <section>
       <Toolbar title={state === "archived" ? t("archive_feed_label_noun") : t("subscriptions_label")}>
         <Menu label={t("filter")} items={filters} icon={<Icon name="filter" />} />
-        <Menu label={t("sort")} items={orders} />
+        {/* Android's subscriptions menu: Sort, the counter and the archive (uncategorized), then Refresh (a container item). */}
         <Menu
           label={t("overflow_more")}
           items={[
+            { label: t("sort"), run: () => setSorting(true) },
             ...counters,
             {
               label: state === "archived" ? t("subscriptions_label") : t("archive_feed_label_noun"),
               run: () => setState(state === "archived" ? "subscribed" : "archived"),
             },
+            refreshItem(sync),
           ]}
         />
       </Toolbar>
+      {sorting && <ChoiceDialog title={t("sort")} choices={orders} value={order} onChoose={setOrder} onClose={() => setSorting(false)} />}
+      <RefreshBar />
       {list.items && list.items.length === 0 ? (
         <Empty icon="subscriptions" title={t("no_subscriptions_head_label")} text={t("no_subscriptions_label")} />
       ) : (
@@ -94,7 +103,15 @@ export function Subscriptions() {
             const chosen = selection.isSelected(p.podcast_id);
             const body = (
               <>
-                <Cover url={p.image_url} title={p.display_title} size={160} />
+                {/* Android's errorIcon: bottom-end on the cover when the last refresh failed. */}
+                <span class="subscription-cover">
+                  <Cover url={p.image_url} title={p.display_title} size={160} />
+                  {failure(p) && (
+                    <span class="subscription-error">
+                      <Icon name="error" />
+                    </span>
+                  )}
+                </span>
                 <span class="subscription-title">{p.display_title}</span>
                 {selection.active ? (
                   // Android's circle_checked and circle_unchecked; the counter is hidden while selecting.
@@ -122,13 +139,13 @@ export function Subscriptions() {
                     class="subscription-tile"
                     role="checkbox"
                     aria-checked={chosen}
-                    aria-label={p.display_title}
+                    aria-label={tileName(p)}
                     onClick={(ev) => selection.click(p.podcast_id, ev.shiftKey)}
                   >
                     {body}
                   </button>
                 ) : (
-                  <a class="subscription-tile" {...linkProps(pathOf({ name: "podcast", id: p.podcast_id }))} aria-label={p.display_title}>
+                  <a class="subscription-tile" {...linkProps(pathOf({ name: "podcast", id: p.podcast_id }))} aria-label={tileName(p)}>
                     {body}
                   </a>
                 )}
@@ -142,7 +159,7 @@ export function Subscriptions() {
       )}
       {list.hasMore && <LoadMore onLoad={list.loadMore} />}
       {selection.active && list.items && (
-        <SelectActions sync={sync} selection={selection} items={list.items} all={list.all} idOf={idOf} actions={shownActions.current} />
+        <SelectActions sync={sync} selection={selection} all={list.all} actions={shownActions.current} />
       )}
       {dialog?.kind === "remove" && <RemoveFeedDialog sync={sync} podcasts={dialog.podcasts} onClose={() => setDialog(null)} />}
       {dialog?.kind === "keep" && <KeepUpdatedDialog sync={sync} podcasts={dialog.podcasts} onClose={() => setDialog(null)} />}

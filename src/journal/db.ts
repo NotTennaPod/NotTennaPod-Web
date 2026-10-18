@@ -3,7 +3,7 @@
 // inside one are never handed out twice.
 
 export const DB_NAME = "nottennapod";
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** Installation is the profile's transport for one account. */
 export interface InstallationRow {
@@ -15,10 +15,28 @@ export interface InstallationRow {
   registered: boolean;
   cursor: string | null; // the newest cursor shown, sent with pushes
   lineage: { log_id: string; epoch: number } | null;
+  /** retired_lineages are the lineages this profile left for a newer one (a restore): their late views are never used again. */
+  retired_lineages?: { log_id: string; epoch: number }[];
+  /** left is the lineage a successor after a refused push left before the new one is known: retired once the server names another. */
+  left?: { log_id: string; epoch: number };
   paused: null | "version_unsupported" | "lineage_unknown";
   predecessors: string[]; // earlier installations of this profile and account (successors after a restore or copy)
-  successor?: { install_id: string; instance_nonce: string }; // a successor being taken (repeated after a crash)
-  recovery?: { recovery_id: string; opened: boolean; finished: boolean }; // recovery after a restore, recorded before it starts
+  /**
+   * successor is a successor being taken (repeated after a crash); `head` is the lineage a restore
+   * moves to, when a view of it was shown: the handoff keeps that lineage and cursor. `sending` is
+   * the tab registering it, until when: one tab of the profile sends the request at a time.
+   */
+  successor?: {
+    install_id: string;
+    instance_nonce: string;
+    head?: { cursor: string; log_id: string; epoch: number };
+    sending?: { by: string; until: number };
+  };
+  /**
+   * recovery is the recovery after a restore, recorded before it starts. `evidence` counts the
+   * predecessor receipts kept for it since: an attempt finishes it only if none arrived meanwhile.
+   */
+  recovery?: { recovery_id: string; opened: boolean; finished: boolean; evidence?: number };
 }
 
 /** Author is one tab load's author chain (PROTOCOL §12). */
@@ -100,6 +118,10 @@ export function openDB(factory: IDBFactory = indexedDB, name = DB_NAME): Promise
       if (e.oldVersion < 2) {
         // Receipted entries of earlier installations, kept for recovery.
         db.createObjectStore("retained", { keyPath: ["account_id", "install_id", "install_seq"] });
+      }
+      if (e.oldVersion < 3) {
+        // The player's sessions by episode: deciding on one episode reads its sessions only, built from those already saved.
+        req.transaction!.objectStore("sessions").createIndex("episode", ["account_id", "episode.episode_id"]);
       }
     };
     req.onsuccess = () => {

@@ -354,17 +354,44 @@ async function rows(page: Page, scope = ".content"): Promise<Row[]> {
   });
 }
 
-/** loadAll presses "Load next page" until the list has every page. */
-async function loadAll(tab: Tab, itemSelector: string): Promise<void> {
-  const more = tab.page.locator(".content button.load-more");
-  const items = tab.page.locator(itemSelector);
-  while (await more.count()) {
-    const n = await items.count();
+/** nextPage is the list's "Load next page"; previousPage its "Load previous page", shown above a list that let go of its first rows. */
+const nextPage = (page: Page) => page.locator(".content").getByRole("button", { name: t("load_next_page_label"), exact: true });
+const previousPage = (page: Page) => page.locator(".content").getByRole("button", { name: w("load_previous_page_label"), exact: true });
+
+/**
+ * everyRow reads every row of a paged list, in order and once each, as a
+ * person paging through it sees them. The list holds a bounded window: as a
+ * page arrives it lets go of the rows furthest above. So each page's rows
+ * are taken as they show, and the next page is waited for by the last row
+ * changing (or "Load next page" going), never by the number of rows growing.
+ * A list that already let go of its first rows (read before, on this
+ * screen) is opened again (`reopen`), so it starts from its first page. A
+ * page that shares no row with those already taken means rows were skipped,
+ * which is an error rather than a short list.
+ */
+async function everyRow<T>(tab: Tab, item: string, read: () => Promise<T[]>, key: (r: T) => string, reopen?: () => Promise<void>): Promise<T[]> {
+  if (reopen && (await previousPage(tab.page).count())) await reopen();
+  const more = nextPage(tab.page);
+  // The last row's link: what changes when a page arrives.
+  const last = () =>
+    tab.page.evaluate((sel) => {
+      const all = document.querySelectorAll(sel);
+      return all.length ? (all[all.length - 1]!.querySelector("a[href]")?.getAttribute("href") ?? "") : null;
+    }, item);
+  const taken = new Map<string, T>();
+  for (;;) {
+    const before = await last();
+    const shown = await read();
+    if (taken.size && shown.length && !shown.some((r) => taken.has(key(r)))) {
+      throw new ActorError("internal", "A page of the list arrived without the rows before it; rows were skipped.");
+    }
+    for (const r of shown) taken.set(key(r), r); // a row seen again keeps its place, with what it shows now
+    if (!(await more.count())) return [...taken.values()];
     await more
       .first()
       .click({ timeout: Math.min(2_000, tab.d.left()) })
       .catch(() => {}); // the list may load it by itself as it scrolls into view
-    await until(tab.d, "the list's next page", async () => (await more.count()) === 0 || (await items.count()) > n);
+    await until(tab.d, "the list's next page", async () => (await more.count()) === 0 || (await last()) !== before);
   }
 }
 
@@ -373,7 +400,7 @@ async function rowOf(tab: Tab, id: string, where: string): Promise<Locator> {
   const row = tab.page.locator(rowsOf(".content")).filter({ has: tab.page.locator(`a.episode-main[href=${css(episodePath(id))}]`) });
   await until(tab.d, `the episode's row in ${where}`, async () => {
     if (await row.count()) return true;
-    const more = tab.page.locator(".content button.load-more");
+    const more = nextPage(tab.page);
     if (await more.count()) await more.first().click({ timeout: Math.min(2_000, tab.d.left()) }).catch(() => {});
     return false;
   });
@@ -448,7 +475,25 @@ export async function setUp(tab: Tab, a: { setup_code: string; username: string;
   await p.getByLabel(t("password_label"), { exact: true }).fill(a.password, { timeout: tab.d.left() });
   await p.getByRole("button", { name: w("setup_button") }).click({ timeout: tab.d.left() });
   await signedIn(tab);
+  await answerRecoveryKeyOffer(tab);
   return { username: a.username };
+}
+
+/**
+ * answerRecoveryKeyOffer says "Not now" to the recovery key the app offers
+ * once after setup (PROTOCOL §11.1), and waits until the offer is settled
+ * (a server whose key is saved makes none).
+ */
+async function answerRecoveryKeyOffer(tab: Tab): Promise<void> {
+  const p = tab.page;
+  const offer = p.getByRole("dialog", { name: w("recovery_key_title") });
+  await until(tab.d, "the recovery key offer after setup", async () => {
+    if (await offer.count()) {
+      await offer.getByRole("button", { name: w("recovery_key_not_now"), exact: true }).click({ timeout: tab.d.left() });
+      return false;
+    }
+    return (await p.evaluate(() => localStorage.getItem("nottennapod.recoveryKeyOffer"))) !== "pending";
+  });
 }
 
 export async function logIn(tab: Tab, a: { username: string; password: string }): Promise<{ username: string; already: boolean }> {
@@ -948,7 +993,7 @@ export async function importFile(tab: Tab, a: { file: string; kind: "opml" | "an
   const input = p.locator(`.import input[type=file][accept^=${css(a.kind === "opml" ? ".opml" : ".db")}]`);
   await input.setInputFiles(a.file, { timeout: tab.d.left() });
   if (a.wait === "started") {
-    await until(tab.d, "the import to start", async () => (await p.locator(".import [role=status]").count()) > 0);
+    await until(tab.d, "the import to start", async () => (await p.locator(".import .import-progress, .import .import-report").count()) > 0);
     return importReading(tab);
   }
   return importResult(tab);
@@ -972,12 +1017,18 @@ export async function importResult(tab: Tab): Promise<ImportReading> {
   );
 }
 
+/**
+ * importReading reads the import as the screen shows it: its progress (the
+ * notice the import shows, such as "Import error: …", and its progress
+ * line) and, once there is one, its report.
+ */
 async function importReading(tab: Tab): Promise<ImportReading> {
   const p = tab.page;
-  const error = p.locator(".import > p[role=status]", { hasText: new RegExp(`^${t("import_error_label")}:`) });
-  if (await error.count()) return { state: "error", text: (await error.innerText()).trim() };
-  const report = p.locator(".import-report");
-  if (!(await report.count())) return { state: "running", text: (await p.locator(".import > p[role=status]").allInnerTexts()).join(" ").trim() };
+  const progress = p.locator(".content .import-progress");
+  const error = progress.locator(":scope > p.error");
+  if (await error.count()) return { state: "error", text: (await error.first().innerText()).trim() };
+  const report = p.locator(".content .import-report");
+  if (!(await report.count())) return { state: "running", text: (await progress.locator(":scope > p").allInnerTexts()).map((x) => x.trim()).join(" ").trim() };
   const lines = (await report.locator(":scope > p").allInnerTexts()).map((s) => s.trim());
   const text = lines[0] ?? "";
   const kinds = [w("import_kind_opml"), w("import_kind_android_db")];
@@ -1019,10 +1070,15 @@ export interface ListReading {
 
 export async function readList(tab: Tab, which: ListName): Promise<ListReading> {
   await listScreen(tab, which);
-  await loadAll(tab, rowsOf(".content"));
+  const episodes = await everyRow(tab, rowsOf(".content"), () => rows(tab.page), (r) => r.episode_id ?? r.title, async () => {
+    // Away (to Settings, which shows no rows) and back, as a person opens the list again from the drawer.
+    await screen(tab, "/settings", t("settings_label"));
+    await tab.page.locator(rowsOf(".content")).first().waitFor({ state: "detached", timeout: tab.d.left() });
+    await listScreen(tab, which);
+  });
   const info = tab.page.locator(".toolbar .toolbar-info");
   return {
-    episodes: await rows(tab.page),
+    episodes,
     counters: await counters(tab.page),
     toolbar_info: (await info.count()) ? (await info.innerText()).trim() : null,
   };
@@ -1039,15 +1095,15 @@ export async function readSubscriptions(tab: Tab): Promise<{ podcasts: { podcast
   await screen(tab, "/subscriptions", t("subscriptions_label"));
   // While it loads, the screen shows an empty grid; loaded, it shows tiles or its empty state.
   await tab.page.locator(".content .subscription-grid > li, .content .empty").first().waitFor({ timeout: tab.d.left() });
-  await loadAll(tab, ".subscription-grid > li");
-  const podcasts = await tab.page.evaluate(() =>
-    [...document.querySelectorAll(".subscription-grid > li > a.subscription-tile")].map((a) => ({
-      podcast_id: decodeURIComponent((a.getAttribute("href") ?? "").slice("/podcast/".length)),
-      title: a.querySelector(".subscription-title")?.textContent ?? "",
-      counter: Number(a.querySelector(".subscription-count")?.textContent ?? 0),
-    })),
-  );
-  return { podcasts };
+  const tiles = () =>
+    tab.page.evaluate(() =>
+      [...document.querySelectorAll(".subscription-grid > li > a.subscription-tile")].map((a) => ({
+        podcast_id: decodeURIComponent((a.getAttribute("href") ?? "").slice("/podcast/".length)),
+        title: a.querySelector(".subscription-title")?.textContent ?? "",
+        counter: Number(a.querySelector(".subscription-count")?.textContent ?? 0),
+      })),
+    );
+  return { podcasts: await everyRow(tab, ".subscription-grid > li", tiles, (x) => x.podcast_id) };
 }
 
 async function statisticsScreen(tab: Tab): Promise<void> {

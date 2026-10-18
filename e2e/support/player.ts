@@ -17,12 +17,16 @@ export interface FixtureEpisode {
   seconds: number;
   /** Podlove simple chapters: start as hh:mm:ss and title. */
   chapters?: [string, string][];
+  /** A Podcast Index chapters file (podcast:chapters), served over plain HTTP as the publisher's JSON. */
+  chapterFile?: unknown;
   /** The file's format: WAV (default), or one made by ffmpeg that some engines cannot play (PROTOCOL §13). */
   format?: "wav" | "m4a-alac" | "ogg-vorbis" | "mp4-opus";
   /** plain serves the file over plain HTTP, which the browser never plays directly (the relay does). */
   plain?: boolean;
   /** etag gives the file a strong validator, so the server's relay serves byte ranges (seekable) rather than the whole file. */
   etag?: boolean;
+  /** delayMs answers every request for the file this much later, the server's and the browser's alike: a publisher behind slow redirects and a slow host. */
+  delayMs?: number;
 }
 
 const formats = {
@@ -52,6 +56,10 @@ export interface Publisher {
   mediaOrigin: string;
   /** requests counts media requests per file, to see what the browser fetched. */
   requests: Map<string, number>;
+  /** agents lists each media request's path and User-Agent, to tell the server's requests from the browser's. */
+  agents: { path: string; agent: string }[];
+  /** certificate is the HTTPS origin's certificate (PEM), for a server told to trust it. */
+  certificate: string;
   stop: () => Promise<void>;
 }
 
@@ -100,35 +108,52 @@ function serveRange(req: IncomingMessage, res: ServerResponse, body: Uint8Array,
 }
 
 export async function startPublisher(show: string, episodes: FixtureEpisode[]): Promise<Publisher> {
-  const files = new Map<string, { body: Uint8Array; type: string; etag?: string }>();
+  const files = new Map<string, { body: Uint8Array; type: string; etag?: string; delayMs?: number }>();
   episodes.forEach((e, i) => {
     const f = e.format ?? "wav";
     const body = f === "wav" ? wav(e.seconds) : encode(e.seconds, f);
-    files.set(`/media/episode-${i + 1}.${formats[f].ext}`, { body, type: formats[f].type, ...(e.etag ? { etag: `"episode-${i + 1}-${body.length}"` } : {}) });
+    files.set(`/media/episode-${i + 1}.${formats[f].ext}`, {
+      body,
+      type: formats[f].type,
+      ...(e.etag ? { etag: `"episode-${i + 1}-${body.length}"` } : {}),
+      ...(e.delayMs ? { delayMs: e.delayMs } : {}),
+    });
   });
   const pathOf = (e: FixtureEpisode, n: number) => `/media/episode-${n}.${formats[e.format ?? "wav"].ext}`;
   const requests = new Map<string, number>();
+  const agents: { path: string; agent: string }[] = [];
   const serveMedia = (req: IncomingMessage, res: ServerResponse) => {
     const path = new URL(req.url ?? "/", "https://x").pathname;
     const file = files.get(path);
     requests.set(path, (requests.get(path) ?? 0) + 1);
+    agents.push({ path, agent: req.headers["user-agent"] ?? "" });
     if (!file) {
       res.writeHead(404).end();
       return;
     }
-    serveRange(req, res, file.body, file.type, file.etag);
+    if (!file.delayMs) serveRange(req, res, file.body, file.type, file.etag);
+    else {
+      const timer = setTimeout(() => serveRange(req, res, file.body, file.type, file.etag), file.delayMs);
+      res.on("close", () => clearTimeout(timer)); // a request given up meanwhile is not answered
+    }
   };
-  const media = createHTTPS(certificate(), serveMedia);
+  const cert = certificate();
+  const media = createHTTPS(cert, serveMedia);
   await new Promise<void>((r) => media.listen(0, "127.0.0.1", r));
   const mediaOrigin = `https://127.0.0.1:${(media.address() as AddressInfo).port}`;
   // The feed's server also serves the plain-HTTP episodes.
   let rss = "";
+  const chapterFiles = new Map<string, string>();
+  episodes.forEach((e, i) => e.chapterFile !== undefined && chapterFiles.set(`/chapters/episode-${i + 1}.json`, JSON.stringify(e.chapterFile)));
   const feed: Server = createServer((req, res) => {
     if (req.url?.startsWith("/feed.xml")) {
       res.writeHead(200, { "Content-Type": "application/rss+xml; charset=utf-8" });
       res.end(rss);
     } else if (req.url?.startsWith("/media/")) serveMedia(req, res);
-    else res.writeHead(404).end();
+    else if (chapterFiles.has(req.url ?? "")) {
+      res.writeHead(200, { "Content-Type": "application/json+chapters" });
+      res.end(chapterFiles.get(req.url ?? ""));
+    } else res.writeHead(404).end();
   });
   await new Promise<void>((r) => feed.listen(0, "127.0.0.1", r));
   const plainOrigin = `http://127.0.0.1:${(feed.address() as AddressInfo).port}`;
@@ -143,11 +168,11 @@ export async function startPublisher(show: string, episodes: FixtureEpisode[]): 
       return `<item><title>${e.title}</title><guid isPermaLink="false">player-${n}</guid><pubDate>${date}</pubDate>
 <itunes:duration>${e.seconds}</itunes:duration>
 <enclosure url="${e.plain ? plainOrigin : mediaOrigin}${path}" length="${file.body.length}" type="${file.type}"/>
-<description><![CDATA[${notes}]]></description>${chapters(e)}</item>`;
+<description><![CDATA[${notes}]]></description>${chapters(e)}${e.chapterFile !== undefined ? `<podcast:chapters url="${plainOrigin}/chapters/episode-${n}.json" type="application/json+chapters"/>` : ""}</item>`;
     })
     .join("\n");
   rss = `<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" xmlns:psc="http://podlove.org/simple-chapters"><channel><title>${show}</title><link>https://example.com/</link>
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" xmlns:psc="http://podlove.org/simple-chapters" xmlns:podcast="https://podcastindex.org/namespace/1.0"><channel><title>${show}</title><link>https://example.com/</link>
 <description>Player journeys</description>
 ${items}
 </channel></rss>`;
@@ -155,6 +180,8 @@ ${items}
     feedURL,
     mediaOrigin,
     requests,
+    agents,
+    certificate: cert.cert.toString("utf8"),
     stop: async () => {
       media.closeAllConnections();
       feed.closeAllConnections();

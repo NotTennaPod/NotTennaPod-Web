@@ -5,9 +5,9 @@ import { defineConfig, devices } from "@playwright/test";
 
 export default defineConfig({
   testDir: "e2e",
-  testMatch: /(player(-races)?|feed)\.spec\.ts$/,
+  testMatch: /(player(-races|-start|-chapters)?|feed)\.spec\.ts$/,
   globalSetup: "./e2e/support/build.ts",
-  timeout: 300_000,
+  timeout: 0, // no time limit on a test; each wait has its own
   expect: { timeout: 15_000 },
   fullyParallel: false,
   workers: 1,

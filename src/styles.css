@@ -561,9 +561,11 @@ button.subscription-tile {
   background: var(--accent);
 }
 
+/* The cover fills its tile, a generated cover too (its own size is inline), so the
+   error icon sits at the cover's corner and tiles keep their gap. */
 .subscription-grid .cover {
-  width: 100%;
-  height: auto;
+  width: 100% !important;
+  height: auto !important;
   aspect-ratio: 1;
 }
 
@@ -583,6 +585,20 @@ button.subscription-tile {
   background: var(--accent);
   color: var(--on-accent);
   text-align: center;
+}
+
+/* Android's errorIcon (subscription_grid_item): 24 px at the cover's bottom-end corner, 8 px in. */
+.subscription-cover {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.subscription-error {
+  position: absolute;
+  inset-block-end: 8px;
+  inset-inline-end: 8px;
+  display: flex;
 }
 
 /* ---- Podcast and episode */
@@ -626,6 +642,25 @@ button.subscription-tile {
   padding-inline: 16px;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+/* Android's txtvFailure (feeditemlist_header, bg_message_error): icon_red text and
+   2 px border, a 10 % red fill, 8 px corners, 16 px in from the sides. */
+.refresh-failed {
+  display: block;
+  width: calc(100% - 32px);
+  margin: 8px 16px;
+  padding: 8px 16px;
+  border: 2px solid #cf1800;
+  border-radius: 8px;
+  background: rgba(207, 24, 0, 0.1);
+  color: #cf1800;
+  text-align: start;
+  cursor: pointer;
+}
+
+.refresh-failed:hover {
+  background: rgba(207, 24, 0, 0.18);
 }
 
 /* Show notes (Android's ShownotesWebView look). */
@@ -757,6 +792,68 @@ section > h3 {
   max-width: 640px;
 }
 
+/* Android's AddPodcastTextView rows (addfeed.xml): full width, the icon at the start and 8 px
+   before the text, centred, at least 48 px tall, padded 8/16, highlighted when pointed at. */
+.add-podcast-rows {
+  display: flex;
+  flex-direction: column;
+  margin-inline: -16px;
+}
+
+.add-podcast-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 48px;
+  padding: 8px 16px;
+  border: 0;
+  background: none;
+  color: var(--text);
+  text-align: start;
+  cursor: pointer;
+}
+
+.add-podcast-row:hover {
+  background: var(--divider);
+}
+
+.add-podcast-row:disabled {
+  color: var(--text-secondary);
+  cursor: default;
+  background: none;
+}
+
+/* The import's progress: its line, a bar as wide as the section, and its actions. */
+.import-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-wrap: anywhere;
+}
+
+.import-progress p {
+  margin: 0;
+}
+
+/* The import report: a title without a space wraps rather than widening the page. */
+.import-report {
+  overflow-wrap: anywhere;
+}
+
+.import-progress progress {
+  display: block;
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.import-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 label {
   display: flex;
   flex-direction: column;
@@ -790,6 +887,11 @@ input {
   padding: 24px;
   background: var(--surface);
   color: var(--text);
+}
+
+/* A message naming something without a space (a file's name) wraps inside the dialog. */
+.dialog > p {
+  overflow-wrap: anywhere;
 }
 
 .dialog::backdrop {
@@ -833,6 +935,56 @@ input {
   flex-wrap: wrap;
   gap: 8px;
   margin-top: 24px;
+}
+
+/* DownloadLogDetailsDialog: each value under its heading (TitleMedium), 8 px apart;
+   long addresses and details wrap, the podcast's name keeps to one line. */
+.details-list {
+  margin: 0;
+}
+
+.details-list dt {
+  font-size: 16px;
+  font-weight: 500;
+}
+
+.details-list dd + dt {
+  margin-top: 8px;
+}
+
+.details-list dd {
+  margin: 0;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+/* contain: its own width never widens the dialog. */
+.details-single-line {
+  contain: inline-size;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.details-copy {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  text-align: start;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.details-copy:hover {
+  background: var(--divider);
+}
+
+/* A Material dialog's neutral button sits at the start, apart from the others. */
+.dialog-neutral {
+  margin-inline-end: auto;
 }
 
 dialog[open]:not([aria-modal]) {
@@ -1056,4 +1208,76 @@ button.episode-main {
 .server-section p,
 .server-section li {
   overflow-wrap: anywhere;
+}
+
+/* Diagnostics: names, addresses and machine-readable reasons wrap within the page. */
+.diagnostics li {
+  overflow-wrap: anywhere;
+}
+
+/* The service page's recovery key: its state, then its action. */
+.server-keys {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.server-keys .dialog-error {
+  margin-top: 0;
+}
+
+/* Back up now: the action, then what became of it. */
+.server-backup-now {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.server-backup-now .dialog-progress,
+.server-backup-now .dialog-error {
+  margin-top: 0;
+}
+
+/* Save recovery key: the file's name and the explanation wrap in narrow windows. */
+.recovery-key p {
+  overflow-wrap: anywhere;
+}
+
+/* The progress of a refresh this browser asked for, at the list's top (Android's swipe-refresh spinner). */
+.refreshing {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 16px;
+  font-size: 14px;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.refreshing progress {
+  display: block;
+  width: 100%;
+  height: 4px;
+  accent-color: var(--accent);
+}
+
+/* At the screen's start in either direction, its own text in its own direction. */
+.refreshing span {
+  align-self: flex-start;
+}
+
+/* Android's single-choice dialog: one row per choice. */
+.choice-options {
+  display: flex;
+  flex-direction: column;
+}
+
+.choice-dialog label.check-row {
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+  min-height: 48px;
+  color: var(--text);
 }

@@ -1,7 +1,8 @@
 // Converts Android AntennaPod 3.12.1's vector drawables (ui/common's ic_*.xml,
 // read from the NotTennaPod-Android checkout at tag 3.12.1) into
 // src/generated/icons.ts, so the browser shows Android's icons, never
-// redrawn ones. Theme colours become currentColor.
+// redrawn ones. Theme colours become currentColor, except the few in
+// themeColours.
 import { execFileSync } from "node:child_process";
 import { writeFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -11,6 +12,14 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const android = process.env.NTP_ANDROID ?? join(root, "..", "NotTennaPod-Android");
 const tag = "3.12.1";
 const dir = "ui/common/src/main/res/drawable/";
+
+// The theme colours that are not the text colour: ic_error's disc is the
+// window background behind Android's red mark (icon_red is #CF1800 in both
+// themes, ui/common styles.xml), so the "!" shows through.
+const themeColours = {
+  "?android:attr/colorBackground": "var(--background)",
+  "?attr/icon_red": "#CF1800",
+};
 
 const attr = (el, name) => {
   const m = new RegExp(`android:${name}="([^"]*)"`).exec(el);
@@ -46,7 +55,7 @@ export function convert(xml) {
     const fill = attr(attrs, "fillColor");
     const stroke = attr(attrs, "strokeColor");
     const p = { d };
-    const colour = (c) => (!c || c.startsWith("?") || c.startsWith("@") ? "currentColor" : c);
+    const colour = (c) => (!c ? "currentColor" : (themeColours[c] ?? (c.startsWith("?") || c.startsWith("@") ? "currentColor" : c)));
     p.fill = fill === undefined ? "none" : colour(fill);
     if (stroke !== undefined) {
       p.stroke = colour(stroke);

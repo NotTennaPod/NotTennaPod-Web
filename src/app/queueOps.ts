@@ -9,7 +9,7 @@
 import { reads, type EpisodeRow, type Summary } from "../api/views.ts";
 import { compareKeys, keyString, uuidValue, type QueueKey } from "../queue/keys.ts";
 import { rekey, sortQueue, type Item, type Placed, type SortOrder } from "../queue/sort.ts";
-import { keyOf, placeBetween, queueAdd, queueMove, queueMoveRun, queueRestore, queueSort, ref, type EpisodeRef, type Place, type Placement } from "./actions.ts";
+import { chunkBytes, chunks, fitsIn, keyOf, oneFactBytes, placeBetween, queueAdd, queueMove, queueMoveRun, queueRestore, queueSort, ref, type EpisodeRef, type Place, type Placement } from "./actions.ts";
 import type { FactBody } from "../journal/journal.ts";
 import { uuid } from "../util/random.ts";
 
@@ -219,14 +219,30 @@ export function savedIndexes(es: EpisodeRow[], queue: EpisodeRow[]): Saved[] {
  * now, clamped to it (PROTOCOL §7.6), in index order, so a removal of
  * several comes back as it was; consecutive ones go back as one run. An
  * episode queued again since is not restored (addQueueItemAt skips it).
- * Undo never sorts.
+ * Undo never sorts. A run goes as one fact when it fits in one (`bytes`:
+ * the largest fact the server accepts), framed if need be. A run too long
+ * for one fact goes as several (`chunks`), each at the run's own place,
+ * journaled last part first: each part then goes in before the parts after
+ * it, so they give exactly what the whole run as one fact gives, also when
+ * another device queued some of them again first (they stay where it put
+ * them). The facts are journaled
+ * together, in order, in one author's chain: the first depends on the queue
+ * seen, and the others observe it through the chain.
  */
-export function restoreAt(saved: Saved[], queue: EpisodeRow[]): FactBody[] {
+export function restoreAt(saved: Saved[], queue: EpisodeRow[], bytes = oneFactBytes): FactBody[] {
   let list = [...queue];
   const out: FactBody[] = [];
   let run: { place: Place; members: Placement[]; next: number } | null = null;
   const close = () => {
-    if (run) out.push(queueRestore(run.members, run.place, queue));
+    if (!run) return;
+    const { place, members } = run;
+    const observed = out.length === 0 ? queue : [];
+    const whole = queueRestore(members, place, observed);
+    if (fitsIn(whole, bytes)) out.push(whole);
+    else {
+      const [last, ...rest] = chunks(members, (ms) => queueRestore(ms, place, []), Math.min(bytes, chunkBytes)).reverse();
+      out.push(queueRestore((last!.payload as { members: Placement[] }).members, place, observed), ...rest);
+    }
     run = null;
   };
   for (const s of [...saved].sort((a, b) => a.index - b.index)) {

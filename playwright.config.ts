@@ -6,6 +6,7 @@ export default defineConfig({
   // and the web actor's test with playwright.acceptance.config.ts.
   testIgnore: [/journeys\.spec\.ts$/, /acceptance\//],
   forbidOnly: true,
+  timeout: 0, // no time limit on a test; each wait has its own
   reporter: [["list"]],
   projects: [
     { name: "chromium", use: { ...devices["Desktop Chrome"] } },

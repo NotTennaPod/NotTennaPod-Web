@@ -70,6 +70,28 @@ export interface CurrentRow {
   title: string;
   podcast: string;
   image: string;
+  /** observed is the position record the paused position was last decided against (absent in rows saved before it was kept). */
+  observed?: Observed | null;
+  /** listened is the newest listening time (last_played) a settled decision saw; it never goes down. */
+  listened?: number;
+}
+
+/**
+ * Observed identifies one version of an episode's position record (PROTOCOL §8.6):
+ * its lineage, generation, claim and provenance (no claim: the episode had no
+ * position record yet), with the episode's last played time. settled says a
+ * decision was taken on it (adopted, our own, a restore rebaselined, or the
+ * position was loaded from it); a record seen while our own claim was
+ * pending is not settled, and is decided again.
+ */
+export interface Observed {
+  log_id: string;
+  epoch: number;
+  generation_id: string | null;
+  claim_id: string | null;
+  provenance: string[]; // sorted
+  last_played: number;
+  settled: boolean;
 }
 
 export const stores = [...journalStores, "sessions", "leases"];
@@ -282,6 +304,11 @@ export async function sessionsOf(db: IDBDatabase, account: string): Promise<Sess
     const range = IDBKeyRange.bound([account, ""], [account, "￿"]);
     return (await req(t.objectStore("sessions").getAll(range))) as SessionRow[];
   });
+}
+
+/** sessionsOfEpisode is the account's sessions of one episode, read through the episode index: never the rest of the history. */
+export async function sessionsOfEpisode(db: IDBDatabase, account: string, episodeId: string): Promise<SessionRow[]> {
+  return tx(db, ["sessions"], "readonly", async (t) => (await req(t.objectStore("sessions").index("episode").getAll(IDBKeyRange.only([account, episodeId])))) as SessionRow[]);
 }
 
 export function emptyLease(account: string): LeaseRow {

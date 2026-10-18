@@ -4,17 +4,19 @@
 import type { ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { t, w, type StringKey } from "../i18n.ts";
-import { reads, type Counters, type PodcastRow } from "../api/views.ts";
+import type { Counters } from "../api/views.ts";
 import { useSync } from "../app/context.ts";
 import { linkProps, pathOf, type Route } from "../app/router.ts";
-import { useChanged, useValue } from "../app/useView.ts";
+import { useValue } from "../app/useView.ts";
+import { useDrawer } from "./drawer.ts";
 import type { IconName } from "../generated/icons.ts";
 import { Icon } from "./Icon.tsx";
 import { Cover } from "./Cover.tsx";
 import { PlayerBar } from "../player/Player.tsx";
 import { changeVolume, playerOf } from "../player/instance.ts";
 import { keyAction } from "../app/keys.ts";
-import { reportFailuresTo, workingValue } from "./progress.ts";
+import { reportFailuresTo, track, workingValue } from "./progress.ts";
+import { failure } from "./feedStatus.ts";
 
 interface NavItem {
   route: Route["name"];
@@ -36,36 +38,18 @@ export const navItems: NavItem[] = [
   { route: "add", label: "add_feed_label", icon: "add" },
 ];
 
-/** useCounters keeps the drawer's counters and subscription list current. */
-function useDrawer(): { counters: Counters | undefined; podcasts: PodcastRow[] } {
-  const changed = useChanged();
-  const [counters, setCounters] = useState<Counters>();
-  const [podcasts, setPodcasts] = useState<PodcastRow[]>([]);
-  useEffect(() => {
-    const ac = new AbortController();
-    reads
-      .subscriptions({ limit: 500 }, ac.signal)
-      .then((p) => {
-        setCounters(p.view.counters);
-        setPodcasts(p.items);
-      })
-      .catch(() => {});
-    return () => ac.abort();
-  }, [changed]);
-  return { counters, podcasts };
-}
-
 export function Shell({ route, children }: { route: Route; children: ComponentChildren }) {
   const sync = useSync();
   const connection = useValue(sync.connection);
   const waiting = useValue(sync.waiting);
   const paused = useValue(sync.paused);
   const refused = useValue(sync.refused);
+  const unsendable = useValue(sync.unsendable);
   const notices = useValue(sync.notices);
   const working = useValue(workingValue);
   useEffect(() => reportFailuresTo((text) => sync.notify(text)), [sync]);
-  const { counters, podcasts } = useDrawer();
   const [open, setOpen] = useState(false);
+  const { counters, podcasts } = useDrawer(open);
   useEffect(() => setOpen(false), [route]);
   const screen = useRef(route.name);
   screen.current = route.name;
@@ -133,6 +117,8 @@ export function Shell({ route, children }: { route: Route; children: ComponentCh
               <a class="nav-item" {...linkProps(pathOf({ name: "podcast", id: p.podcast_id }))}>
                 <Cover url={p.image_url} title={p.display_title} size={40} />
                 <span class="nav-label">{p.display_title}</span>
+                {/* Android's itxtvFailure: before the counter, named for screen readers. */}
+                {failure(p) && <Icon name="error" label={t("refresh_failed_msg")} />}
                 {p.counter ? <span class="nav-count">{p.counter}</span> : null}
               </a>
             </li>
@@ -166,6 +152,11 @@ export function Shell({ route, children }: { route: Route; children: ComponentCh
             {paused === "lineage_unknown" ? w("lineage_unknown") : w("pushes_paused_version")}
           </div>
         )}
+        {unsendable && (
+          <div class="banner" role="alert">
+            {w("changes_too_large")}
+          </div>
+        )}
         {children}
       </div>
       <PlayerBar />
@@ -177,7 +168,8 @@ export function Shell({ route, children }: { route: Route; children: ComponentCh
               <button
                 class="text-button"
                 onClick={() => {
-                  n.action!.run();
+                  const run = n.action!.run;
+                  void track(Promise.resolve().then(run));
                   sync.dismiss(n.id);
                 }}
               >

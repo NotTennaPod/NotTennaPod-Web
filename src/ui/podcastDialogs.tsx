@@ -126,7 +126,7 @@ export async function removeAllInbox(sync: Sync, podcasts: PodcastRow[]): Promis
       fresh.push(...page.items);
       token = page.next_page_token ?? undefined;
     }
-    if (fresh.length) await sync.act(act.dismiss(fresh, true));
+    if (fresh.length) await sync.actAll(act.dismissAll(fresh));
   }
 }
 

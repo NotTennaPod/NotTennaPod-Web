@@ -9,7 +9,8 @@ import { useView } from "../app/useView.ts";
 import { Cover } from "../ui/Cover.tsx";
 import { EpisodeItem } from "../ui/EpisodeList.tsx";
 import { Icon } from "../ui/Icon.tsx";
-import { IconButton, Loading, Toolbar } from "../ui/components.tsx";
+import { IconButton, Loading, Menu, RefreshBar, Toolbar, refreshItem } from "../ui/components.tsx";
+import { useSync } from "../app/context.ts";
 import { readSetting } from "../ui/settings.ts";
 
 // Android keeps one seed per process; the browser keeps one per tab.
@@ -53,6 +54,7 @@ function PodcastCard({ p }: { p: PodcastRow }) {
 }
 
 export function Home() {
+  const sync = useSync();
   const [shuffle, setShuffle] = useState(seed);
   const view = useView(
     (signal) =>
@@ -65,7 +67,10 @@ export function Home() {
   const h = view.data;
   return (
     <section>
-      <Toolbar title={t("home_label")} />
+      <Toolbar title={t("home_label")}>
+        <Menu label={t("overflow_more")} items={[refreshItem(sync)]} />
+      </Toolbar>
+      <RefreshBar />
       {!h ? (
         <Loading />
       ) : (

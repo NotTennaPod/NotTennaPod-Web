@@ -10,6 +10,7 @@ import { openDB, type Receipt } from "../src/journal/db.ts";
 import { entries, installation, newAuthor, retire, updateInstallation } from "../src/journal/journal.ts";
 import { pushAll, type PushResponse } from "../src/journal/pusher.ts";
 import { retainedEntries, takeSuccessor } from "../src/journal/successor.ts";
+import { FakeServer } from "./fakeServer.ts";
 
 /** FakeChannel is BroadcastChannel between the tabs of one test: a message reaches every other channel of its name. */
 class FakeChannel extends EventTarget {
@@ -49,23 +50,37 @@ function answer(body: { operations: { install_seq: number; fact: { op_id: string
 }
 
 let pushes = 0;
+/** successors are the successor installations registered: a tab finishing another's plan repeats its request with the same IDs (idempotent, PROTOCOL §5). */
+const successors = new Set<string>();
 /** inventory is the restored server's answer for each recovered entry: it has it, or needs it uploaded (then joined). */
 let inventory: "have" | "need" = "have";
 const recoveryCalls: string[] = [];
-globalThis.fetch = (async (path: string, init: { body: string }) => {
-  const body = JSON.parse(init.body);
+/** server follows the real registration, session and cookie rules where a test sets it (fakeServer.ts). */
+let server: FakeServer | null = null;
+globalThis.fetch = (async (path: string, init: { body?: string }) => {
+  const body = init.body ? JSON.parse(init.body) : {};
+  if (server) {
+    const answer = await server.answer(path, body, (p, b) => JSON.parse(answerOf(p, b)));
+    if (path === "/v1/installations/successor" && answer.ok) successors.add(body.install_id);
+    return answer;
+  }
+  if (path === "/v1/installations/successor") successors.add(body.install_id);
+  return new Response(answerOf(path, body), { status: 200, headers: { "Content-Type": "application/json" } });
+}) as unknown as typeof fetch;
+
+function answerOf(path: string, body: Record<string, any>): string {
   let out: unknown = {};
   if (path === "/v1/push") {
     pushes++;
-    out = answer(body);
+    out = answer(body as Parameters<typeof answer>[0]);
   } else if (path === "/v1/sync/recovery/inventory") {
     out = { results: body.entries.map((e: { op_id: string }) => ({ kind: "fact", id: e.op_id, status: inventory })) };
   } else if (path === "/v1/sync/recovery/upload") {
     out = { head: cursor, results: body.entries.map((e: { receipt: Receipt }) => ({ kind: "fact", id: e.receipt.op_id, status: "joined" })) };
   }
   if (path.startsWith("/v1/sync/recovery/") || path === "/v1/snapshot") recoveryCalls.push(path);
-  return new Response(JSON.stringify(out), { status: 200, headers: { "Content-Type": "application/json" } });
-}) as unknown as typeof fetch;
+  return JSON.stringify(out);
+}
 
 async function until(check: () => boolean | Promise<boolean>): Promise<void> {
   for (let i = 0; i < 1000; i++) {
@@ -192,7 +207,7 @@ test("a refusal the restore's recovery finds on the server is still shown by the
     await pushAll(p.db, p.account, async (body) => answer(body as never)); // another tab pushes it; its receipts never reach a
     await retire(p.db, p.account, head); // kept for a, as a refusal a waits for
     // The server is restored: another tab takes the successor, and the acknowledged entry is kept aside for recovery.
-    await takeSuccessor(p.db, p.account, async () => {}, { freshNonce: false, device: { name: "b", app_version: "1", capabilities: [] }, recovery: true });
+    await takeSuccessor(p.db, p.account, async () => {}, { from: (await installation(p.db, p.account)).install_id, freshNonce: false, device: { name: "b", app_version: "1", capabilities: [] }, recovery: true });
     a.schedule(0); // a's loop runs the recovery first (inventory: have, or need and then joined), then looks for its outcomes
     await until(() => a.notices.get().some((n) => n.text === "No subscriptions"));
     assert.ok(recoveryCalls.includes(result === "have" ? "/v1/sync/recovery/inventory" : "/v1/sync/recovery/upload"), recoveryCalls.join());
@@ -202,4 +217,39 @@ test("a refusal the restore's recovery finds on the server is still shown by the
     assert.equal((await installation(p.db, p.account)).recovery?.finished, true);
     for (const n of a.notices.get()) a.dismiss(n.id);
   }
+});
+
+test("a late view of a lineage the profile left changes nothing: no successor, and the lineage never goes back", async () => {
+  const p = await profile();
+  const first = await installation(p.db, p.account);
+  server = new FakeServer(p.account, first.install_id, first.instance_nonce);
+  const a = await p.tab();
+  const b = await p.tab();
+  const lineage = async () => (await installation(p.db, p.account)).lineage;
+  // The server was restored: a new epoch of its log. The profile takes a successor and retires the old epoch.
+  await a.shown({ cursor, log_id: head.log_id, epoch: 2, seq: 1 });
+  assert.equal(successors.size, 1);
+  assert.deepEqual(await lineage(), { log_id: head.log_id, epoch: 2 });
+  assert.deepEqual((await installation(p.db, p.account)).retired_lineages, [{ log_id: head.log_id, epoch: 1 }]);
+  // A view answered before the restore arrives late, in this tab and in one that never saw the restore.
+  for (const tab of [a, b]) {
+    await tab.shown({ cursor, log_id: head.log_id, epoch: 1, seq: 9 });
+    assert.equal(successors.size, 1, "no successor for a late view");
+    assert.deepEqual(await lineage(), { log_id: head.log_id, epoch: 2 });
+  }
+  // The account's log is replaced: the log it leaves is retired too, and its late views change nothing.
+  const replaced = crypto.randomUUID();
+  await b.shown({ cursor, log_id: replaced, epoch: 1, seq: 1 });
+  assert.equal(successors.size, 2);
+  assert.deepEqual(await lineage(), { log_id: replaced, epoch: 1 });
+  await a.shown({ cursor, log_id: head.log_id, epoch: 2, seq: 5 });
+  assert.equal(successors.size, 2);
+  assert.deepEqual(await lineage(), { log_id: replaced, epoch: 1 });
+  // A successor the push asks for (lineage_mismatch) retires the lineage it leaves as well.
+  await a.successor(false, { cursor, log_id: replaced, epoch: 2, seq: 1 }, (await installation(p.db, p.account)).install_id);
+  assert.deepEqual((await installation(p.db, p.account)).retired_lineages?.at(-1), { log_id: replaced, epoch: 1 });
+  assert.equal(server.registrations.length, successors.size, "each successor registered once");
+  assert.equal(server.unauthorized, 0, "the browser's session was never revoked");
+  for (const t of [a, b]) t.schedule(1_000_000);
+  server = null;
 });

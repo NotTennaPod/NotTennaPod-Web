@@ -6,7 +6,7 @@ import { t, plural, type StringKey } from "../i18n.ts";
 import { reads, type EpisodeRow, type Records, type Summary } from "../api/views.ts";
 import { useSync } from "../app/context.ts";
 import * as act from "../app/actions.ts";
-import { Confirm, Empty, Menu, Toolbar, type MenuItem } from "../ui/components.tsx";
+import { Confirm, Empty, Menu, RefreshBar, Toolbar, refreshItem, type MenuItem } from "../ui/components.tsx";
 import { Icon } from "../ui/Icon.tsx";
 import { SortDialog, dateOption, durationOption, titleOption, type SortOption } from "../ui/SortDialog.tsx";
 import { sortQueueNow, wholeQueue } from "../app/queueOps.ts";
@@ -90,7 +90,7 @@ export function Queue() {
   const policy = summary.data?.policies.queue;
   // Clear queue removes the whole queue shown, not only the loaded pages.
   const clear = async () => {
-    await sync.act(act.queueClear(await list.all()));
+    await sync.actAll(act.chunks(await list.all(), act.queueClear));
     setConfirm(false);
   };
   return (
@@ -100,24 +100,28 @@ export function Queue() {
         <Menu
           label={t("overflow_more")}
           items={[
+            // Android orders its menus by category: Sort and Clear queue, then Refresh (a container item).
             { label: t("sort"), run: () => setSorting(true) },
             { label: t("clear_queue_label"), disabled: items.length === 0, run: () => setConfirm(true) },
+            refreshItem(sync),
           ]}
         />
       </Toolbar>
+      <RefreshBar />
       {sorting && policy && summary.data && <QueueSort policy={policy} records={summary.data.records} onClose={() => setSorting(false)} />}
       <EpisodeList
         items={list.items}
         select={{
           total: list.total,
           all: list.all,
-          // The loaded order; more after it while pages remain (the selection is never last then).
-          queue: { order: [...items.map((e) => e.episode_id), ...(list.hasMore ? [""] : [])], keepSorted: !!policy?.keep_sorted },
+          // The loaded order; more before and after it while rows remain (the selection is never first or last then).
+          queue: { order: [...(list.hasBefore ? [""] : []), ...items.map((e) => e.episode_id), ...(list.hasMore ? [""] : [])], keepSorted: !!policy?.keep_sorted },
         }}
         where="queue"
         hasMore={list.hasMore}
         loadMore={list.loadMore}
         loading={list.loading}
+        window={list.window}
         empty={<Empty icon="playlist_play" title={t("no_items_header_label")} text={t("no_items_label")} />}
       />
       {confirm && (
@@ -140,11 +144,14 @@ export function Inbox() {
         <Menu
           label={t("overflow_more")}
           items={[
-            { label: t("remove_all_inbox_label"), disabled: items.length === 0, run: () => setConfirm(true) },
+            // Sort, then the container items in Android's order: Refresh, Remove all from Inbox.
             { label: t("sort"), run: () => setSorting(true) },
+            refreshItem(sync),
+            { label: t("remove_all_inbox_label"), disabled: items.length === 0, run: () => setConfirm(true) },
           ]}
         />
       </Toolbar>
+      <RefreshBar />
       {sorting && <SortDialog options={[dateOption, durationOption]} value={order} onChange={setOrder} onClose={() => setSorting(false)} />}
       <EpisodeList
         items={list.items}
@@ -153,6 +160,7 @@ export function Inbox() {
         hasMore={list.hasMore}
         loadMore={list.loadMore}
         loading={list.loading}
+        window={list.window}
         empty={<Empty icon="inbox" title={t("no_inbox_head_label")} text={t("no_inbox_label")} />}
       />
       {confirm && (
@@ -161,8 +169,8 @@ export function Inbox() {
           message={t("remove_all_inbox_confirmation_msg")}
           onCancel={() => setConfirm(false)}
           onConfirm={async () => {
-            // Exactly the observed NEW episodes, every page of them (PROTOCOL §7.2: dismiss_all).
-            await sync.act(act.dismiss(await list.all(), true));
+            // Exactly the observed NEW episodes, every page of them (PROTOCOL §7.2: dismiss_all), in facts the server accepts.
+            await sync.actAll(act.dismissAll(await list.all()));
             setConfirm(false);
           }}
         />
@@ -180,6 +188,7 @@ const filterGroups: [StringKey, string, StringKey, string][] = [
 ];
 
 export function Episodes() {
+  const sync = useSync();
   const [order, setOrder] = useLocalSetting("episodes_sort", "date_new_old");
   const [filter, setFilter] = useLocalSetting("episodes_filter", "");
   const list = usePaged((q, s) => reads.episodes({ ...q, sort: order, filter }, s), [order, filter]);
@@ -198,8 +207,9 @@ export function Episodes() {
       <Toolbar title={t("episodes_label")}>
         <span class="toolbar-info" dir="auto">{list.items ? plural("num_episodes", list.total) : ""}</span>
         <Menu label={t("filter")} items={filterItems} icon={<Icon name="filter" />} />
-        <Menu label={t("overflow_more")} items={[{ label: t("sort"), run: () => setSorting(true) }]} />
+        <Menu label={t("overflow_more")} items={[{ label: t("sort"), run: () => setSorting(true) }, refreshItem(sync)]} />
       </Toolbar>
+      <RefreshBar />
       {sorting && <SortDialog options={[dateOption, durationOption]} value={order} onChange={setOrder} onClose={() => setSorting(false)} />}
       <EpisodeList
         items={list.items}
@@ -207,6 +217,7 @@ export function Episodes() {
         hasMore={list.hasMore}
         loadMore={list.loadMore}
         loading={list.loading}
+        window={list.window}
         empty={
           <Empty icon="feed" title={t("no_all_episodes_head_label")} text={props.length ? t("no_all_episodes_filtered_label") : t("no_all_episodes_label")} />
         }
@@ -216,14 +227,16 @@ export function Episodes() {
 }
 
 export function Favorites() {
+  const sync = useSync();
   const [order, setOrder] = useLocalSetting("favorites_sort", "date_new_old");
   const list = usePaged((q, s) => reads.favorites({ ...q, sort: order }, s), [order]);
   const [sorting, setSorting] = useState(false);
   return (
     <section>
       <Toolbar title={t("favorite_episodes_label")}>
-        <Menu label={t("overflow_more")} items={[{ label: t("sort"), run: () => setSorting(true) }]} />
+        <Menu label={t("overflow_more")} items={[refreshItem(sync), { label: t("sort"), run: () => setSorting(true) }]} />
       </Toolbar>
+      <RefreshBar />
       {sorting && <SortDialog options={[dateOption, durationOption]} value={order} onChange={setOrder} onClose={() => setSorting(false)} />}
       <EpisodeList
         items={list.items}
@@ -231,6 +244,7 @@ export function Favorites() {
         hasMore={list.hasMore}
         loadMore={list.loadMore}
         loading={list.loading}
+        window={list.window}
         empty={<Empty icon="star" title={t("no_fav_episodes_head_label")} text={t("no_fav_episodes_label")} />}
       />
     </section>
@@ -263,6 +277,7 @@ export function History() {
         hasMore={list.hasMore}
         loadMore={list.loadMore}
         loading={list.loading}
+        window={list.window}
         empty={<Empty icon="history" title={t("no_history_head_label")} text={t("no_history_label")} />}
       />
       {confirm && (

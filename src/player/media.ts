@@ -4,11 +4,15 @@
 // path, whose stream starts at a time and is offset onto the episode's
 // timeline, and is fed through a MediaSource where the browser takes it
 // (mse.ts). Media Session metadata and actions where the browser has them.
-import type { EpisodeInfo, Media } from "./engine.ts";
+import type { EpisodeInfo, Media, MediaListener } from "./engine.ts";
 import { Feed, mediaSourceFor, type FeedOptions } from "./mse.ts";
 
 const metadataWaitMs = 15_000;
 const playWaitMs = 30_000;
+/** A dropped connection is asked about again with the views' backoff (2, 4 … 60 s), and at once when the browser comes online. */
+const connectionWaitMs = 2_000;
+const connectionWaitMaxMs = 60_000;
+const mediaErrNetwork = 2; // MediaError.MEDIA_ERR_NETWORK
 
 /** Descriptor is the server's answer on how to play an episode (PROTOCOL §13). */
 export interface Descriptor {
@@ -41,11 +45,65 @@ export interface Sources {
   status(url: string): Promise<MediaStatus | null>;
   /** wording is Android's text for an error label (PROTOCOL §13). */
   wording(e: { label: string; message: string }): string;
+  /** reachable says whether the app's own server answers at all; without it, this device is taken as connected. */
+  reachable?(): Promise<boolean>;
 }
 
 /** episodeKey names an episode's source for the element: the server chooses it. */
 export function episodeKey(episodeId: string): string {
   return `episode:${episodeId}`;
+}
+
+/**
+ * DirectFailures are the episodes whose publisher URL failed in this browser
+ * (PROTOCOL §13): their descriptors are asked with direct_failed, so the
+ * server chooses the relay at once rather than a URL that fails again.
+ */
+export interface DirectFailures {
+  has(episodeId: string): boolean;
+  add(episodeId: string): void;
+}
+
+export const directFailureMs = 24 * 60 * 60 * 1000;
+export const directFailureMax = 200;
+
+/**
+ * directFailures keeps them in the browser's storage, per account, for a day
+ * and the newest 200: a reload and a server restart (which forgets what it
+ * was told) do not make the browser try them again. Without storage they last
+ * the page load.
+ */
+export function directFailures(storage: Pick<Storage, "getItem" | "setItem"> | null, account: string, now: () => number = Date.now): DirectFailures {
+  const key = `nottennapod:${account}:direct_failed`;
+  const here = new Map<string, number>(); // this page's, whatever the storage does
+  const stored = (): Record<string, unknown> => {
+    try {
+      const v: unknown = JSON.parse(storage?.getItem(key) ?? "{}");
+      return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+    } catch {
+      return {};
+    }
+  };
+  const live = (at: unknown, t: number): at is number => typeof at === "number" && t - at < directFailureMs && at - t < directFailureMs;
+  return {
+    has(episodeId) {
+      const t = now();
+      return live(here.get(episodeId), t) || live(stored()[episodeId], t);
+    },
+    add(episodeId) {
+      const t = now();
+      here.set(episodeId, t);
+      const kept = Object.entries(stored())
+        .filter((e): e is [string, number] => e[0] !== episodeId && live(e[1], t))
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, directFailureMax - 1);
+      try {
+        storage?.setItem(key, JSON.stringify(Object.fromEntries([[episodeId, t], ...kept])));
+      } catch {
+        /* storage full or refused: this page still remembers */
+      }
+    },
+  };
 }
 
 export class AudioMedia implements Media {
@@ -58,6 +116,10 @@ export class AudioMedia implements Media {
   #loading = false; // a load error is the load's to report
   #reloading = false; // the element's own events during a reload are not the player's
   #recovered = 0; // reloads after errors or unfinished ends, per load
+  #held: number | null = null; // where a source a network error broke plays on, while its recovery is pending (#broke)
+  #riding: (() => void) | null = null; // wakes the recovery under way; null when none runs
+  #owner = 0; // the newest recovery of a broken source: an older one's late answers change nothing
+  #shown = false; // the player was told the media waits for the connection
   #epoch = 0; // the source's generation (each load, unload and reload): work begun for an older one changes nothing
   #wantsPlay = false; // the player's intent: play() sets it, pause() clears it; the element's paused state is only transient
   #rate: number; // the player's speed; on the element path a compatibility stream gets it once it plays (#started)
@@ -67,13 +129,15 @@ export class AudioMedia implements Media {
   #feed: Feed | null = null; // a compatibility stream fed through Media Source Extensions (mse.ts)
   #feedOptions: FeedOptions;
   #sources: Sources | null;
-  #l: { paused(): void; ended(): void; time(): void; error(): void } | null = null;
+  #failures: DirectFailures | null;
+  #l: MediaListener | null = null;
   lastError: string | null = null;
 
-  constructor(rate: number, sources: Sources | null = null, opts: { feed?: FeedOptions } = {}) {
+  constructor(rate: number, sources: Sources | null = null, opts: { feed?: FeedOptions; failures?: DirectFailures } = {}) {
     this.#sources = sources;
     this.#rate = rate;
     this.#feedOptions = opts.feed ?? {};
+    this.#failures = opts.failures ?? null;
     const el = document.createElement("audio");
     el.preload = "metadata";
     el.hidden = true;
@@ -98,6 +162,7 @@ export class AudioMedia implements Media {
   }
 
   get position(): number {
+    if (this.#held !== null) return this.#held;
     if (this.#target !== null) return this.#target;
     if (this.#pendingSeek !== null) return this.#pendingSeek;
     return this.#offset + Math.round(this.el.currentTime * 1000);
@@ -151,10 +216,24 @@ export class AudioMedia implements Media {
     return this.#caps;
   }
 
-  /** #describe asks the server how to play the episode at position; one wait when it is busy. */
+  /**
+   * prepare asks the server's media types ahead of the first play, so
+   * starting an episode never waits for them (the answer is kept for the page load).
+   */
+  prepare(): void {
+    void this.#capabilities();
+    void this.#profiles();
+  }
+
+  /**
+   * #describe asks the server how to play the episode at position; one wait
+   * when it is busy. An episode whose publisher URL failed in this browser
+   * is asked for with direct_failed.
+   */
   async #describe(episodeId: string, position: number, extra: Record<string, unknown> = {}): Promise<Descriptor> {
     const [capabilities] = await Promise.all([this.#capabilities(), this.#profiles()]);
-    const body = { capabilities, start_ms: Math.max(0, Math.round(position)), ...extra };
+    const remembered = this.#failures?.has(episodeId) ? { direct_failed: true } : {};
+    const body = { capabilities, start_ms: Math.max(0, Math.round(position)), ...remembered, ...extra };
     try {
       return await this.#sources!.describe(episodeId, body);
     } catch (e) {
@@ -268,8 +347,16 @@ export class AudioMedia implements Media {
         if (reached === "failed") throw new Error(this.lastError ?? "media error");
         return;
       }
+      if (this.el.error?.code === mediaErrNetwork) {
+        // Offline, the publisher is not blamed: the source waits for the connection, and Play plays on once connected.
+        const at = await this.#broke(position);
+        if (!current()) throw superseded();
+        if (at === null) return;
+        position = at;
+      }
       const retry = this.#desc?.mode === "direct" ? { direct_failed: true } : this.#desc?.mode === "relay" ? { force: "compat" } : null;
       if (!retry) throw new Error(this.lastError ?? "media error");
+      if ("direct_failed" in retry) this.#failures?.add(episode);
       const again = await this.#describe(episode, position, retry);
       if (!current()) throw superseded();
       url = this.#use(again, position);
@@ -354,6 +441,9 @@ export class AudioMedia implements Media {
 
   /** #begin starts a new generation of the source: what an older one still awaits (a status, a descriptor, metadata) is dropped. */
   #begin(): number {
+    this.#held = null;
+    this.#riding?.();
+    this.#showWait(false);
     this.#loading = false;
     this.#reloading = false;
     this.#target = null;
@@ -421,6 +511,12 @@ export class AudioMedia implements Media {
     this.#wantsPlay = true;
     // A reload under way starts its stream when it is ready, or reports that it cannot.
     if (this.#reloading) return;
+    // A source a dropped connection broke plays on once connected: a wait under way asks at once.
+    if (this.#held !== null) {
+      if (this.#riding) this.#riding();
+      else void this.#rideOut(this.#own(this.#held), 0);
+      return;
+    }
     try {
       await this.#started();
     } catch (e) {
@@ -457,6 +553,7 @@ export class AudioMedia implements Media {
 
   pause(): void {
     this.#wantsPlay = false;
+    this.#riding?.();
     this.el.pause();
   }
 
@@ -470,6 +567,10 @@ export class AudioMedia implements Media {
    */
   seek(position: number): void {
     const p = Math.max(0, Math.round(position));
+    if (this.#held !== null) {
+      this.#held = p; // a source the dropped connection broke plays on there once connected
+      return;
+    }
     if (this.#compat) {
       void this.#reload(p, null).then((ok) => ok || this.#failed());
       return;
@@ -532,7 +633,7 @@ export class AudioMedia implements Media {
       return;
     }
     const mine = this.#epoch;
-    const position = this.position;
+    let position = this.position;
     const st = await this.#sources.status(d.url).catch(() => undefined);
     // Another source, or a seek's stream, replaced the one that ended: its end is not the new one's.
     if (mine !== this.#epoch) return;
@@ -550,10 +651,22 @@ export class AudioMedia implements Media {
       if (!(await this.#reload(position, {}))) this.#failed();
       return;
     }
+    if (st === undefined) {
+      // The server could not be asked: offline, the drop is waited out.
+      const at = await this.#broke(position);
+      if (at === null) return;
+      position = at;
+    }
     if (this.#recovered++ > 0 || !(await this.#reload(position, null))) this.#failed();
   }
 
-  /** #errored handles an error while playing: one recovery, then the player is told. */
+  /**
+   * #errored handles an error while playing: one recovery, then the player
+   * is told. A network error while this device is offline is waited out
+   * instead (#rideOut): it uses up no recovery, and the publisher is not
+   * blamed for it. Only a publisher that fails while the app's own server
+   * answers is remembered as direct-failed.
+   */
   async #errored(): Promise<void> {
     const d = this.#desc;
     if (!d || !this.#sources) {
@@ -561,7 +674,12 @@ export class AudioMedia implements Media {
       return;
     }
     const mine = this.#epoch;
-    const position = this.position;
+    let position = this.position;
+    if (this.el.error?.code === mediaErrNetwork) {
+      const at = await this.#broke(position);
+      if (at === null) return;
+      position = at;
+    }
     if (d.url && d.mode !== "direct") {
       const st = await this.#sources.status(d.url).catch(() => undefined);
       if (mine !== this.#epoch) return; // another source, or a seek's stream, replaced the one that failed
@@ -572,20 +690,143 @@ export class AudioMedia implements Media {
       return;
     }
     const retry = d.mode === "direct" ? { direct_failed: true } : d.mode === "relay" ? { force: "compat" } : {};
+    const episode = this.#key ? this.#episodeOf(this.#key) : null;
+    if (d.mode === "direct" && episode) this.#failures?.add(episode);
     if (!(await this.#reload(position, retry))) this.#failed();
   }
 
-  listen(l: { paused(): void; ended(): void; time(): void; error(): void }): void {
+  /** #offline says whether this device is offline: the browser says so, or the app's own server does not answer either. */
+  async #offline(): Promise<boolean> {
+    if (typeof navigator !== "undefined" && navigator.onLine === false) return true;
+    return this.#sources?.reachable ? !(await this.#sources.reachable()) : false;
+  }
+
+  /** #own makes a recovery of the source broken at position the newest: it holds the position (a seek moves it) until it plays on. */
+  #own(position: number): number {
+    this.#held = position;
+    this.#pendingSeek = null;
+    this.#riding = () => {};
+    return ++this.#owner;
+  }
+
+  /**
+   * #owns says whether a recovery still owns the media: the newest, its
+   * position still held. Only another source or an unload lets the position
+   * go before the recovery ends (a seek moves it), so a reload of its own
+   * never ends it.
+   */
+  #owns(id: number): boolean {
+    return id === this.#owner && this.#held !== null;
+  }
+
+  #showWait(on: boolean): void {
+    if (this.#shown === on) return;
+    this.#shown = on;
+    this.#l?.waiting?.(on);
+  }
+
+  /**
+   * #broke takes on a source a network error broke at position: its recovery
+   * is pending from before the connection check, so a seek meanwhile moves
+   * where it plays on. Offline, the drop is waited out (#rideOut) and the
+   * answer is null; connected, the answer is the position, to recover as a
+   * real failure. Null too when another source or a newer recovery took
+   * over meanwhile, and when Pause came during a playing recovery: the
+   * position stays held for Play, and nothing is blamed. A recovery that
+   * began paused (a load) still classifies its failure.
+   */
+  async #broke(position: number): Promise<number | null> {
+    const playing = this.#wantsPlay;
+    const id = this.#own(position);
+    const offline = await this.#offline();
+    if (!this.#owns(id)) return null;
+    if (offline || (playing && !this.#wantsPlay)) {
+      void this.#rideOut(id);
+      return null;
+    }
+    const at = this.#held!;
+    this.#held = null;
+    this.#riding = null;
+    return at;
+  }
+
+  /**
+   * #rideOut waits for this device's connection while the player wants
+   * playback, and shows the wait. It asks again with the views' backoff and
+   * at once when the browser comes online; once connected it reloads at the
+   * held position from a new descriptor, again while a seek meanwhile moved
+   * it, and lets the position go only once a reload at it is in place. A
+   * reload that fails offline waits again; one that fails while connected is
+   * a real failure, reported as before. Pause ends the wait (Play waits
+   * again), after any of its steps; another source, an unload or a newer
+   * recovery takes it over: what it learns later changes nothing, and only
+   * the recovery that owns the wait ends it.
+   */
+  async #rideOut(id: number, delay = connectionWaitMs): Promise<void> {
+    const owns = () => this.#owns(id) && this.#wantsPlay;
+    let wake = () => {};
+    this.#riding = () => wake();
+    const online = () => wake();
+    globalThis.addEventListener?.("online", online);
+    try {
+      for (;;) {
+        if (!owns()) return;
+        this.#showWait(true);
+        if (delay > 0) {
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, delay);
+            wake = () => (clearTimeout(timer), resolve());
+          });
+          wake = () => {};
+          if (!owns()) return;
+        }
+        delay = Math.min(connectionWaitMaxMs, Math.max(connectionWaitMs, delay * 2));
+        const offline = await this.#offline();
+        if (!owns()) return;
+        if (offline) continue;
+        const at = this.#held!;
+        const ok = await this.#reload(at, {});
+        if (!this.#owns(id)) return;
+        if (ok) {
+          if (this.#held === at) {
+            this.#held = null; // in place at its target (playing, unless Pause came)
+            return;
+          }
+          delay = 0; // a seek moved the target meanwhile: reload there
+          continue;
+        }
+        // The reload failed: a drop during it waits again, a real failure ends as before.
+        const dropped = await this.#offline();
+        if (!owns()) return;
+        if (!dropped) {
+          this.#held = null;
+          this.#failed();
+          return;
+        }
+        this.lastError = null; // a dropped connection is no failure to report
+        delay = connectionWaitMs;
+      }
+    } finally {
+      globalThis.removeEventListener?.("online", online);
+      if (this.#owner === id) {
+        this.#riding = null;
+        this.#showWait(false);
+      }
+    }
+  }
+
+  listen(l: MediaListener): void {
     this.#l = l;
+    // While a dropped connection holds the source (#held), the broken element's own events are not the player's.
     this.el.addEventListener("pause", () => {
-      if (!this.#reloading) l.paused();
+      if (!this.#reloading && this.#held === null) l.paused();
     });
     this.el.addEventListener("ended", () => {
-      if (!this.#reloading) void this.#ended();
+      if (!this.#reloading && this.#held === null) void this.#ended();
     });
     this.el.addEventListener("timeupdate", () => l.time());
     this.el.addEventListener("error", () => {
-      if (this.el.error && this.#key && !this.#loading && !this.#reloading) void this.#errored();
+      if (this.el.error && this.#key && !this.#loading && !this.#reloading && this.#held === null) void this.#errored();
     });
   }
 }

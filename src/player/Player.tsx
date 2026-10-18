@@ -19,6 +19,7 @@ import { ShowNotes } from "../shownotes/ShowNotes.tsx";
 import { externalLink } from "../shownotes/sanitize.ts";
 import { defaultSpeeds, formatSpeed, maxSpeed, minSpeed, rewindMs, fastForwardMs, speedStep } from "./accounting.ts";
 import type { Chapter, Player, PlayerState } from "./engine.ts";
+import { useChapters } from "./chapters.ts";
 import { usePlayer } from "./instance.ts";
 import "./player.css";
 
@@ -65,17 +66,55 @@ function ControlButton({ icon, label, caption, onClick }: { icon: IconName; labe
   );
 }
 
+const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
+
 /**
- * BarPosition is the position bar in a wide window's player bar: the
- * player screen's slider, elapsed time and length, so a desktop window seeks
- * without opening the player.
+ * SeekBar is the position slider as AudioPlayerFragment's ChapterSeekBar
+ * draws it: the track split at each chapter's start, the played part in the
+ * accent colour, and the current chapter's segment raised while it is dragged
+ * (on Android also for a second after a step that changes chapter: here after
+ * a keyboard step). With card, the chapter title and time at the drag
+ * position show above it, as cardViewSeek does; the keyboard's steps show it
+ * for a second. Screen readers hear the chapter with the position.
  */
-function BarPosition({ s, player }: { s: PlayerState; player: Player }) {
-  const [drag, setDrag] = useState<number | null>(null);
+function SeekBar({ s, player, chapters, drag, setDrag, card }: {
+  s: PlayerState;
+  player: Player;
+  chapters: Chapter[];
+  drag: number | null;
+  setDrag: (v: number | null) => void;
+  card?: boolean;
+}) {
+  const [stepped, setStepped] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  useEffect(() => () => clearTimeout(timer.current), []);
   const position = drag ?? s.position;
+  const marked = s.duration > 0 && chapters.length > 0;
+  // setChapterDividers: 0, each chapter's start relative to the duration, 1.
+  const dividers = marked ? [0, ...chapters.map((c) => clamp01(c.start / s.duration)), 1] : [0, 1];
+  const at = afterPosition(chapters, position);
+  const title = at > -1 ? chapters[at]!.title : "";
+  const gap = marked ? 2 : 0;
+  // Drawn twice: the track, and over it the played part, cut off at the position.
+  const segments = () =>
+    dividers.slice(1).map((right, i) => (
+      <span
+        key={i}
+        class={i === at + 1 ? "current" : undefined}
+        style={{ left: `${dividers[i]! * 100}%`, width: `calc(${(right - dividers[i]!) * 100}% - ${gap}px)` }}
+      />
+    ));
+  const played = s.duration > 0 ? clamp01(position / s.duration) : 0;
+  const shown = drag !== null || stepped;
+  const valueText = w("position", localized(position));
   return (
-    <span class="player-bar-wide player-bar-position" dir="ltr">
-      <span class="player-elapsed">{durationLong(position)}</span>
+    <div class={`seek-bar${marked && shown ? " raised" : ""}`}>
+      <div class="seek-track" aria-hidden="true">
+        <div class="seek-layer">{segments()}</div>
+        <div class="seek-layer played" style={{ clipPath: `inset(0 ${(1 - played) * 100}% 0 0)` }}>
+          {segments()}
+        </div>
+      </div>
       <input
         type="range"
         min={0}
@@ -84,14 +123,42 @@ function BarPosition({ s, player }: { s: PlayerState; player: Player }) {
         value={position}
         disabled={!(s.duration > 0)}
         aria-label={w("position_bar")}
-        aria-valuetext={w("position", localized(position))}
+        aria-valuetext={title ? `${valueText}, ${title}` : valueText}
         onInput={(ev) => setDrag(Number((ev.target as HTMLInputElement).value))}
         onChange={(ev) => {
           const v = Number((ev.target as HTMLInputElement).value);
           setDrag(null);
           void player.seek(v);
         }}
+        onKeyDown={(ev) => {
+          if (!/^(Arrow|Page|Home$|End$)/.test(ev.key)) return;
+          setStepped(true);
+          clearTimeout(timer.current);
+          timer.current = setTimeout(() => setStepped(false), 1000);
+        }}
       />
+      {card && shown && (
+        <div class="seek-card" aria-hidden="true">
+          {title && <span dir="auto">{title}</span>}
+          <span>{durationLong(position)}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * BarPosition is the position bar in a wide window's player bar: the
+ * player screen's slider, elapsed time and length, so a desktop window seeks
+ * without opening the player.
+ */
+function BarPosition({ s, player, chapters }: { s: PlayerState; player: Player; chapters: Chapter[] }) {
+  const [drag, setDrag] = useState<number | null>(null);
+  const position = drag ?? s.position;
+  return (
+    <span class="player-bar-wide player-bar-position" dir="ltr">
+      <span class="player-elapsed">{durationLong(position)}</span>
+      <SeekBar s={s} player={player} chapters={chapters} drag={drag} setDrag={setDrag} />
       <span class="player-length">{durationLong(s.duration)}</span>
     </span>
   );
@@ -104,6 +171,7 @@ export function PlayerBar() {
   const [open, setOpen] = useState(false);
   const [speed, setSpeed] = useState(false);
   const opener = useRef<HTMLButtonElement>(null);
+  const { chapters, refresh } = useChapters(s?.episode ?? null, s?.mode === "here", open);
   useEffect(() => {
     if (s?.mode !== "here") setOpen(false);
   }, [s?.mode]);
@@ -149,7 +217,7 @@ export function PlayerBar() {
               <ControlButton icon="fast_forward" label={t("fast_forward_label")} caption={String(fastForwardMs / 1000)} onClick={() => void player.fastForward()} />
               <ControlButton icon="skip_48dp" label={t("skip_episode_label")} onClick={() => void player.skip()} />
             </span>
-            <BarPosition s={s} player={player} />
+            <BarPosition s={s} player={player} chapters={chapters} />
             <span class="player-bar-wide">
               <ControlButton icon="playback_speed" label={t("playback_speed")} caption={formatSpeed(s.rate)} onClick={() => setSpeed(true)} />
             </span>
@@ -164,6 +232,8 @@ export function PlayerBar() {
         <PlayerScreen
           player={player}
           s={s}
+          chapters={chapters}
+          refreshChapters={refresh}
           onClose={() => {
             setOpen(false);
             opener.current?.focus();
@@ -174,7 +244,13 @@ export function PlayerBar() {
   );
 }
 
-function PlayerScreen({ player, s, onClose }: { player: Player; s: PlayerState; onClose: () => void }) {
+function PlayerScreen({ player, s, chapters, refreshChapters, onClose }: {
+  player: Player;
+  s: PlayerState;
+  chapters: Chapter[];
+  refreshChapters: (() => Promise<Chapter[] | null>) | null;
+  onClose: () => void;
+}) {
   const ref = useRef<HTMLDivElement>(null);
   const [drag, setDrag] = useState<number | null>(null);
   const [remaining, setRemaining] = useLocalSetting("show_remaining_time", "false");
@@ -185,7 +261,6 @@ function PlayerScreen({ player, s, onClose }: { player: Player; s: PlayerState; 
   }, []);
   const e = s.episode!;
   const position = drag ?? s.position;
-  const chapters = e.chapters ?? [];
   const shown = shownChapter(chapters, position, s.duration);
   const left = Math.max(0, s.duration - position);
   const showLeft = remaining === "true";
@@ -273,29 +348,13 @@ function PlayerScreen({ player, s, onClose }: { player: Player; s: PlayerState; 
             </p>
           )}
         </div>
-        {chaptersOpen && <ChaptersDialog chapters={chapters} s={s} player={player} onClose={() => setChaptersOpen(false)} />}
+        {chaptersOpen && <ChaptersDialog chapters={chapters} s={s} player={player} refresh={refreshChapters} onClose={() => setChaptersOpen(false)} />}
         <div class="player-notes">
           <ShowNotes html={e.description} durationMs={s.duration} onSeek={(ms) => void player.seek(ms)} />
         </div>
       </div>
       <div class="player-controls" dir="ltr">
-        <input
-          type="range"
-          class="player-position"
-          min={0}
-          max={Math.max(s.duration, 1)}
-          step={1000}
-          value={position}
-          disabled={!(s.duration > 0)}
-          aria-label={w("position_bar")}
-          aria-valuetext={w("position", localized(position))}
-          onInput={(ev) => setDrag(Number((ev.target as HTMLInputElement).value))}
-          onChange={(ev) => {
-            const v = Number((ev.target as HTMLInputElement).value);
-            setDrag(null);
-            void player.seek(v);
-          }}
-        />
+        <SeekBar s={s} player={player} chapters={chapters} drag={drag} setDrag={setDrag} card />
         <div class="player-times">
           <span class="player-elapsed" aria-label={w("position", localized(position))}>
             {durationLong(position)}
@@ -321,13 +380,12 @@ function PlayerScreen({ player, s, onClose }: { player: Player; s: PlayerState; 
   );
 }
 
-/** SpeedDialog is VariableSpeedDialog: the speed bar with − and +, and the presets. Skip silence needs audio processing the browser's player lacks. */
-/** afterPosition is Chapter.getAfterPosition: the chapter playing at a position, or −1 before the first. */
 /** chapterLink is a chapter's link when it may open outside the app. */
 function chapterLink(link: string | null): string | null {
   return link ? externalLink(link, location.origin) : null;
 }
 
+/** afterPosition is Chapter.getAfterPosition: the chapter playing at a position, or −1 before the first. */
 function afterPosition(chapters: Chapter[], position: number): number {
   const i = chapters.findIndex((c) => c.start > position);
   return i === -1 ? chapters.length - 1 : i - 1;
@@ -374,9 +432,22 @@ function ChapterControl({ chapters, shown, s, player, onOpen }: { chapters: Chap
   );
 }
 
-/** ChaptersDialog is ChaptersFragment: each chapter's title, start, duration and link; the current one marked. */
-function ChaptersDialog({ chapters, s, player, onClose }: { chapters: Chapter[]; s: PlayerState; player: Player; onClose: () => void }) {
+/**
+ * ChaptersDialog is ChaptersFragment: each chapter's title, start, duration
+ * and link; the current one marked. An episode with a chapters file has
+ * Refresh, which reads the file again; with no chapters then, the dialog
+ * closes and says so.
+ */
+function ChaptersDialog({ chapters, s, player, refresh, onClose }: {
+  chapters: Chapter[];
+  s: PlayerState;
+  player: Player;
+  refresh: (() => Promise<Chapter[] | null>) | null;
+  onClose: () => void;
+}) {
+  const sync = useSync();
   const ref = useRef<HTMLDialogElement>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const current = afterPosition(chapters, s.position);
   useEffect(() => {
     ref.current?.showModal();
@@ -424,6 +495,23 @@ function ChaptersDialog({ chapters, s, player, onClose }: { chapters: Chapter[];
         })}
       </ul>
       <div class="dialog-buttons">
+        {refresh && (
+          <button
+            class="text-button dialog-neutral"
+            disabled={refreshing}
+            onClick={async () => {
+              setRefreshing(true);
+              const now = await refresh();
+              setRefreshing(false);
+              if (now?.length === 0) {
+                onClose();
+                sync.notify(t("no_chapters_label"));
+              }
+            }}
+          >
+            {t("refresh_label")}
+          </button>
+        )}
         <button class="text-button" onClick={onClose}>
           {t("close_label")}
         </button>
@@ -432,6 +520,7 @@ function ChaptersDialog({ chapters, s, player, onClose }: { chapters: Chapter[];
   );
 }
 
+/** SpeedDialog is VariableSpeedDialog: the speed bar with − and +, and the presets. Skip silence needs audio processing the browser's player lacks. */
 function SpeedDialog({ player, rate, onClose }: { player: Player; rate: number; onClose: () => void }) {
   const sync = useSync();
   const ref = useRef<HTMLDialogElement>(null);

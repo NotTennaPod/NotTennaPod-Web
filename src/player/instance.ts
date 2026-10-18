@@ -6,9 +6,10 @@ import { t, w, type StringKey } from "../i18n.ts";
 import { reads } from "../api/views.ts";
 import { wholeQueue } from "../app/queueOps.ts";
 import type { Sync } from "../app/sync.ts";
+import { Rereader, type ReaderDeps } from "../app/heads.ts";
 import { readSetting, writeSetting } from "../ui/settings.ts";
 import { Player, type Channel, type Message, type PlayerState } from "./engine.ts";
-import { AudioMedia, mediaSession, type Descriptor, type MediaStatus, type Sources } from "./media.ts";
+import { AudioMedia, directFailures, mediaSession, type Descriptor, type MediaStatus, type Sources } from "./media.ts";
 import { ApiError, get, post } from "../api/http.ts";
 import { exportPending, listeningFrontier } from "./store.ts";
 import { uuid } from "../util/random.ts";
@@ -106,6 +107,11 @@ const sources: Sources = {
     }
   },
   wording: (e) => (labels[e.label] ? t(labels[e.label]!) : e.message),
+  // Any answer of the app's own server, even an error, means this device is connected.
+  reachable: () => fetch("/healthz", { cache: "no-store", signal: AbortSignal.timeout(10_000) }).then(
+    () => true,
+    () => false,
+  ),
 };
 
 function channel(account: string): Channel {
@@ -121,11 +127,21 @@ function channel(account: string): Channel {
   };
 }
 
+/** storage is the browser's localStorage, or null where it is refused (some private modes). */
+function storage(): Storage | null {
+  try {
+    return localStorage;
+  } catch {
+    return null;
+  }
+}
+
 /** startPlayer creates the tab's player and loads the current episode paused (PROTOCOL §12). */
 export function startPlayer(sync: Sync): Player {
   const existing = players.get(sync);
   if (existing) return existing;
-  const media = new AudioMedia(Number(readSetting("playback_speed", "1")) || 1, sources);
+  const media = new AudioMedia(Number(readSetting("playback_speed", "1")) || 1, sources, { failures: directFailures(storage(), sync.account) });
+  media.prepare(); // the media types, before the first play needs them
   media.el.volume = volumeSetting();
   medias.set(sync, media);
   const player = new Player({
@@ -168,14 +184,51 @@ export function startPlayer(sync: Sync): Player {
       session.position(s.position, s.duration, s.rate);
     }
   });
-  sync.changed.subscribe(() => void player.refresh());
+  followHeads(sync, player);
   // The speed is a profile setting: another tab's change applies here too.
   window.addEventListener("storage", (e) => {
     if (e.key === `nottennapod:${sync.account}:playback_speed` && e.newValue) player.setRate(Number(e.newValue) || 1);
   });
-  window.addEventListener("pagehide", () => player.pageHidden());
+  window.addEventListener("pagehide", (e) => player.pageHidden(e.persisted));
   void player.boot();
   return player;
+}
+
+/**
+ * followHeads re-reads the current episode once per newer head the tab learns
+ * (only when newer than the view the player holds) and on every revalidation;
+ * a read that fails is tried again with the views' backoff (2, 4 … 60 s) until
+ * one succeeds; a hidden tab's player reads only while it plays, and once when
+ * the tab shows again if it skipped one. The player's controls never wait for
+ * these reads (they run beside its chain).
+ */
+export function followHeads(
+  sync: Pick<Sync, "known" | "revalidate" | "visible">,
+  player: Pick<Player, "refresh" | "state" | "viewHead"> & { readonly refreshFailed?: boolean; subscribe?: Player["subscribe"] },
+  timers: Pick<ReaderDeps, "setTimeout" | "clearTimeout"> = {},
+): () => void {
+  const reader = new Rereader({
+    known: () => sync.known.get(),
+    shown: () => player.viewHead,
+    visible: () => sync.visible.get() || player.state.playing,
+    read: async () => {
+      await player.refresh();
+      if (player.refreshFailed) throw new Error("player: the episode could not be read");
+      return player.viewHead;
+    },
+    failed: () => true,
+    ...timers,
+  });
+  const offs = [
+    sync.known.subscribe(() => reader.known()),
+    sync.revalidate.subscribe(() => reader.revalidate()),
+    sync.visible.subscribe(() => reader.visible()),
+    ...(player.subscribe ? [player.subscribe(() => reader.visible())] : []),
+  ];
+  return () => {
+    reader.stop();
+    offs.forEach((off) => off());
+  };
 }
 
 /**

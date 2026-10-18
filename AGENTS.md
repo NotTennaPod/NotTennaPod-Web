@@ -18,7 +18,7 @@ The target is AntennaPod's latest tagged release. The code is currently built ar
 
 ## How to build and test
 
-Node 24 or later.
+Node 24 or later. The suites that run a server also need Go 1.26 or later (or `NTP_SERVER_BINARY`); the player suite and the acceptance test need `openssl` (1.1.1 or later), and the player suite ffmpeg and ffprobe 6 or later (see the README).
 
 ```sh
 npm ci

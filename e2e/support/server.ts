@@ -20,7 +20,8 @@ export interface RunningServer {
   cli: (args: string[]) => string;
 }
 
-export async function startServer(): Promise<RunningServer> {
+/** env adds to the server's environment: a journey's server that trusts the fixture publisher's certificate (SSL_CERT_FILE). */
+export async function startServer(opts: { env?: Record<string, string> } = {}): Promise<RunningServer> {
   const dir = mkdtempSync(join(tmpdir(), "ntp-e2e-"));
   const port = 20000 + Math.floor(Math.random() * 20000);
   const base = `http://127.0.0.1:${port}`;
@@ -30,7 +31,7 @@ export async function startServer(): Promise<RunningServer> {
       serverBinary,
       ["--listen", `127.0.0.1:${port}`, "--data-dir", join(dir, "data"), "--web-dir", join(root, "dist"), "--dev-allow-loopback-feeds",
         "--refresh-interval", "24h"],
-      { stdio: ["ignore", "ignore", "pipe"] },
+      { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, ...opts.env } },
     );
     proc = p;
     let log = "";
@@ -78,6 +79,8 @@ export interface Feeds {
   logins: string[];
   /** failNext makes the private feed's next request fail with 503, as a publisher's outage does. */
   failNext: () => void;
+  /** breakable is a feed (Breakable Show) that answers malformed XML while broken, as a publisher's broken feed does. */
+  breakable: { url: string; setBroken: (broken: boolean) => void };
   stop: () => Promise<void>;
 }
 
@@ -92,11 +95,15 @@ export async function startFeeds(): Promise<Feeds> {
   const rss = `<?xml version="1.0"?><rss version="2.0"><channel><title>Journey Show</title><link>https://example.com/</link>${items}</channel></rss>`;
   let login = "alice:s3cret";
   let failing = false;
+  let broken = false;
   const logins: string[] = [];
   const server: Server = createServer((req, res) => {
     if (req.url?.startsWith("/feed.xml")) {
       res.writeHead(200, { "Content-Type": "application/rss+xml" });
       res.end(rss);
+    } else if (req.url?.startsWith("/breakable.xml")) {
+      res.writeHead(200, { "Content-Type": "application/rss+xml" });
+      res.end(broken ? "<rss version=\"2.0\"><channel><title>Breakable Show</title><item>" : rss.replace("<title>Journey Show</title>", "<title>Breakable Show</title>").replaceAll("journey-", "breakable-"));
     } else if (req.url?.startsWith("/private.xml")) {
       // A private feed: Basic authentication with its current login.
       const sent = req.headers.authorization?.startsWith("Basic ") ? Buffer.from(req.headers.authorization.slice(6), "base64").toString("utf8") : "";
@@ -126,6 +133,12 @@ export async function startFeeds(): Promise<Feeds> {
     logins,
     failNext: () => {
       failing = true;
+    },
+    breakable: {
+      url: `http://127.0.0.1:${port}/breakable.xml`,
+      setBroken: (b) => {
+        broken = b;
+      },
     },
     stop: () => new Promise((r) => server.close(() => r())),
   };

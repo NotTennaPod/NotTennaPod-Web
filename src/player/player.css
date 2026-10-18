@@ -103,9 +103,8 @@
     padding-inline: 16px;
     font-variant-numeric: tabular-nums;
   }
-  .player-bar-position input {
+  .player-bar-position .seek-bar {
     flex: 1;
-    accent-color: var(--accent);
   }
   .player-bar .control-button .icon {
     width: 28px;
@@ -220,11 +219,139 @@
   background: var(--background);
 }
 
-.player-position {
-  display: block;
-  width: calc(100% - 16px);
+.player-controls > .seek-bar {
   margin: 12px 8px 0;
-  accent-color: var(--accent);
+}
+
+/* ---- the position bar (ChapterSeekBar): the range input over a track split
+   at each chapter's start, its played part in the accent colour; the current
+   chapter's segment raised while dragged; cardViewSeek above it. Left to right
+   in every language, as on Android. */
+
+.seek-bar {
+  position: relative;
+  height: 24px;
+}
+
+.seek-bar input {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 24px;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  -webkit-appearance: none;
+  appearance: none;
+  cursor: pointer;
+}
+
+.seek-bar input:disabled {
+  cursor: default;
+}
+
+.seek-bar input::-webkit-slider-runnable-track {
+  height: 24px;
+  background: none;
+}
+
+.seek-bar input::-moz-range-track {
+  height: 24px;
+  background: none;
+}
+
+.seek-bar input::-moz-range-progress {
+  background: none;
+}
+
+.seek-bar input::-webkit-slider-thumb {
+  width: 16px;
+  height: 16px;
+  margin-top: 4px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--accent);
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.seek-bar input::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.seek-bar input:disabled::-webkit-slider-thumb {
+  background: var(--text-secondary);
+  opacity: 0.38;
+}
+
+.seek-bar input:disabled::-moz-range-thumb {
+  background: var(--text-secondary);
+  opacity: 0.38;
+}
+
+/* The thumb's centre travels between half a thumb from each end: so does the track. */
+.seek-track {
+  position: absolute;
+  top: calc(50% - 4px);
+  height: 8px;
+  left: 8px;
+  right: 8px;
+  pointer-events: none;
+}
+
+.seek-layer {
+  position: absolute;
+  inset: 0;
+}
+
+.seek-layer > span {
+  position: absolute;
+  top: 2px;
+  height: 4px;
+  background: color-mix(in srgb, var(--surface-variant) 50%, transparent);
+}
+
+.seek-layer.played > span {
+  background: var(--accent);
+}
+
+.seek-bar.raised .seek-layer > .current {
+  top: 1px;
+  height: 6px;
+}
+
+.seek-card {
+  position: absolute;
+  bottom: calc(100% + 12px);
+  left: 50%;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: max-content;
+  max-width: calc(100% - 32px);
+  padding: 4px 24px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.565);
+  color: #ffffff;
+  font-size: 16px;
+  text-align: center;
+  overflow-wrap: anywhere;
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+@media (prefers-color-scheme: dark) {
+  .seek-card {
+    background: rgba(91, 91, 91, 0.565);
+  }
 }
 
 .player-times {

@@ -297,3 +297,27 @@ test("a random sort carries its permutation: the order drawn, of exactly the epi
   assert.deepEqual(p.sort.permutation.map((r) => r.episode_id), ids([q[1]!, q[2]!, q[0]!]));
   assert.ok(!("permutation" in (sortQueueNow("acct", q, "date_old_new").payload.sort as object)), "only random carries one");
 });
+
+test("wholeQueue meeting an expired view mid-walk stops with the server's message and never starts the walk again", async () => {
+  const { wholeQueue } = await import("../src/app/queueOps.ts");
+  const { ApiError } = await import("../src/api/http.ts");
+  const asked: string[] = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (url: string) => {
+    asked.push(String(url));
+    if (String(url).includes("page_token")) {
+      return new Response(JSON.stringify({ error: "view_expired", message: "This list changed; load it again." }), { status: 410, headers: { "Content-Type": "application/json" } });
+    }
+    const head = { cursor: "c", log_id: "l", epoch: 1, seq: 1 };
+    return new Response(JSON.stringify({ head, view: { counters: { queue: 600, inbox: 0 } }, total: 600, items: queueOf("A", "B"), next_page_token: "t2" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+  try {
+    await assert.rejects(wholeQueue(), (e: unknown) => e instanceof ApiError && e.code === "view_expired" && e.message === "This list changed; load it again.");
+    assert.equal(asked.length, 2, "no second walk");
+  } finally {
+    globalThis.fetch = original;
+  }
+});

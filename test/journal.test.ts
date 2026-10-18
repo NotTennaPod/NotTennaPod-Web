@@ -229,7 +229,7 @@ test("a handoff the server finished is completed without asking it again", async
   await updateInstallation(db, account, (r) => (r.successor = planned));
   // boot: the session is already bound to the planned successor, so its send does nothing.
   let sent = 0;
-  const inst = await takeSuccessor(db, account, async () => void sent++, { freshNonce: false, device: { name: "t", app_version: "0", capabilities: [] } });
+  const inst = await takeSuccessor(db, account, async () => void sent++, { from: (await installation(db, account)).install_id, freshNonce: false, device: { name: "t", app_version: "0", capabilities: [] } });
   assert.equal(inst.install_id, planned.install_id);
   assert.equal(inst.successor, undefined);
   assert.equal((await unacknowledged(db, account))[0]!.install_id, planned.install_id);

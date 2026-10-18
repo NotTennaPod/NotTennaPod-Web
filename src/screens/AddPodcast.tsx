@@ -2,19 +2,23 @@
 // RSS address with a preview (fetched by the server), credentials when the
 // feed asks, subscribe, open an existing podcast; and importing an OPML list
 // or an AntennaPod database into an empty account (PROTOCOL §11.5).
-import { useState } from "preact/hooks";
+import { useRef, useState } from "preact/hooks";
+import type { RefObject } from "preact";
 import { t, w, plural } from "../i18n.ts";
-import { ApiError, get, post, request } from "../api/http.ts";
+import { ApiError } from "../api/http.ts";
 import { reads, type Preview } from "../api/views.ts";
 import * as act from "../app/actions.ts";
 import { useSync } from "../app/context.ts";
 import { navigate, pathOf } from "../app/router.ts";
 import { Cover } from "../ui/Cover.tsx";
 import { Toolbar } from "../ui/components.tsx";
+import { Icon } from "../ui/Icon.tsx";
 import { formatAbbrev, durationLong } from "../ui/format.ts";
 import { plainText } from "./Podcast.tsx";
-import { Sha256, uuid } from "../util/random.ts";
-import { ImportReport, type ImportStatus } from "../ui/ImportReport.tsx";
+import { uuid } from "../util/random.ts";
+import { ImportProgress, useImportJob } from "../ui/ImportProgress.tsx";
+import * as importJob from "../app/importJob.ts";
+import { busy as importBusy } from "../app/importMachine.ts";
 import { maxCredentialBytes } from "../app/feedLogin.ts";
 
 const errorText: Record<string, Parameters<typeof t>[0]> = {
@@ -47,7 +51,8 @@ export function AddPodcast() {
   const subscribe = async () => {
     if (!preview?.url) return;
     let secretId: string | undefined;
-    const body = act.subscribe(preview.url);
+    // A podcast the account removed: subscribing again opens a fresh one (PROTOCOL §7.2).
+    const body = act.subscribe(preview.url, { observed: preview.observed });
     if (creds && preview.feed) {
       secretId = uuid();
       body.payload.credentials_secret = secretId;
@@ -139,7 +144,7 @@ export function AddPodcast() {
             <div>
               <h2>{preview.feed.title}</h2>
               {preview.feed.author && <p class="secondary podcast-author">{preview.feed.author}</p>}
-              {preview.podcast_id ? (
+              {preview.podcast_id && !preview.observed ? (
                 <button class="filled-button" onClick={() => navigate(pathOf({ name: "podcast", id: preview.podcast_id! }))}>
                   {t("open_podcast")}
                 </button>
@@ -176,65 +181,43 @@ export function AddPodcast() {
 
 let lastOrigin: string | undefined;
 
-/** importMaxFile is the server's limit for an imported file (importer.MaxFile). */
-const importMaxFile = 2 * 2 ** 30;
-
-/** Import uploads a file in base64 chunks and follows the import to publication (PROTOCOL §11.5). */
+/** Import uploads a file and follows the import to publication and its first refresh (PROTOCOL §11.5), as the tab's job. */
 function Import() {
-  const [status, setStatus] = useState<string>();
-  const [report, setReport] = useState<ImportStatus>();
-  const upload = async (file: File, kind: "opml" | "android_db") => {
-    setStatus(w("import_uploading"));
-    setReport(undefined);
-    try {
-      // The server takes at most 2 GiB; the file is read one chunk at a time,
-      // so a large backup never sits in memory whole.
-      if (file.size > importMaxFile) throw new Error(w("import_too_large"));
-      const chunk = 3 << 20;
-      const slice = async (i: number) => new Uint8Array(await file.slice(i, i + chunk).arrayBuffer());
-      const hash = new Sha256();
-      for (let i = 0; i < file.size; i += chunk) hash.update(await slice(i));
-      const fingerprint = [...hash.digest()].map((x) => x.toString(16).padStart(2, "0")).join("");
-      const r = await post<{ import_id: string; status: string }>("/v1/import", { kind, fingerprint, size: file.size, file_name: file.name });
-      for (let i = 0, n = 0; i < file.size; i += chunk, n++) {
-        let s = "";
-        for (const b of await slice(i)) s += String.fromCharCode(b);
-        await request("PUT", `/v1/import/${r.import_id}/chunks/${n}`, { data: btoa(s) });
-      }
-      await post(`/v1/import/${r.import_id}/finish`);
-      setStatus(undefined);
-      for (;;) {
-        const s = await get<ImportStatus>(`/v1/import/${r.import_id}`);
-        setReport(s);
-        if (s.status === "published" || s.status === "failed") return;
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      }
-    } catch (e) {
-      setStatus(`${t("import_error_label")}: ${e instanceof ApiError || e instanceof Error ? e.message : String(e)}`);
-    }
-  };
-  const picker = (kind: "opml" | "android_db", accept: string, label: string) => (
-    <label class="outlined-button">
-      {label}
+  const view = useImportJob();
+  const busy = importBusy(view.state);
+  const opml = useRef<HTMLInputElement>(null);
+  const database = useRef<HTMLInputElement>(null);
+  // Android's AddPodcastTextView rows: a button (reached with Tab) that opens its own file chooser.
+  const picker = (kind: "opml" | "android_db", accept: string, label: string, input: RefObject<HTMLInputElement | null>) => (
+    <>
+      <button type="button" class="add-podcast-row" disabled={busy} onClick={() => input.current?.click()}>
+        <Icon name="download" />
+        <span>{label}</span>
+      </button>
       <input
+        ref={input}
         type="file"
         accept={accept}
         hidden
         onChange={(e) => {
-          const f = (e.target as HTMLInputElement).files?.[0];
-          if (f) void upload(f, kind);
+          const el = e.target as HTMLInputElement;
+          const f = el.files?.[0];
+          // Cleared, so the same file can be chosen again (to continue its upload).
+          el.value = "";
+          if (f) importJob.choose(f, kind);
         }}
       />
-    </label>
+    </>
   );
   return (
     <div class="import">
       <h3>{t("import_export_pref")}</h3>
       <p class="secondary">{w("import_explanation")}</p>
-      {picker("opml", ".opml,.xml,text/xml,text/x-opml", t("opml_add_podcast_label"))}
-      {picker("android_db", ".db,application/octet-stream", t("database_import_label"))}
-      {status && <p role="status">{status}</p>}
-      {report && <ImportReport status={report} />}
+      <div class="add-podcast-rows">
+        {picker("opml", ".opml,.xml,text/xml,text/x-opml", t("opml_add_podcast_label"), opml)}
+        {picker("android_db", ".db,application/octet-stream", t("database_import_label"), database)}
+      </div>
+      <ImportProgress view={view} />
     </div>
   );
 }

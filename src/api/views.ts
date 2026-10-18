@@ -77,6 +77,10 @@ export interface ListPage<T> {
   total: number;
   items: T[];
   next_page_token: string | null;
+  /** A window's (a first request with an anchor): the index of its first item, the page before it, and the view's first page. */
+  offset?: number;
+  prev_page_token?: string | null;
+  start_page_token?: string;
 }
 
 export interface Installation {
@@ -127,6 +131,7 @@ export interface Statistics {
 export interface Preview {
   url?: string;
   podcast_id?: string;
+  observed?: { podcast_id: string; generation_id: string; state: string }; // the account removed the podcast: what a re-subscribe observes
   error?: { label: string; code?: number; detail?: string; origin?: string };
   links?: { url: string; title: string }[];
   feed?: {

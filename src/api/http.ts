@@ -18,6 +18,13 @@ export class ApiError extends Error {
 /** Unreachable is a request that never got an answer: the server is down or the network is. */
 export class Unreachable extends Error {}
 
+/**
+ * Unreadable is a success whose body could not be read whole (the connection
+ * ended part-way): the server did the request, but what it answered is not
+ * known. Only requestStrict throws it.
+ */
+export class Unreadable extends Error {}
+
 let account: string | undefined;
 let generation = 0; // the tab's authentication generation (PROTOCOL §12)
 let onAccountChanged: () => void = () => location.reload();
@@ -36,6 +43,11 @@ export function endGeneration(): void {
 
 export function currentAccount(): string | undefined {
   return account;
+}
+
+/** currentGeneration is the tab's authentication generation: a job bound to one stops when it changes. */
+export function currentGeneration(): number {
+  return generation;
 }
 
 /** handlers sets what happens when the server says another account signed in, or the session ended. */
@@ -62,7 +74,20 @@ export function withQuery(path: string, q?: Query): string {
 }
 
 /** request sends one API request and returns its JSON body. */
-export async function request<T = Record<string, unknown>>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+export function request<T = Record<string, unknown>>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+  return send<T>(method, path, body, signal, false);
+}
+
+/**
+ * requestStrict is request for answers that must be known exactly (an
+ * import's reservation, finish and cancel): a success whose body cannot be read
+ * throws Unreadable instead of answering {}.
+ */
+export function requestStrict<T = Record<string, unknown>>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+  return send<T>(method, path, body, signal, true);
+}
+
+async function send<T>(method: string, path: string, body: unknown, signal: AbortSignal | undefined, strict: boolean): Promise<T> {
   const started = generation;
   const headers: Record<string, string> = { Accept: "application/json" };
   if (account) headers["X-NotTennaPod-Account"] = account;
@@ -84,8 +109,10 @@ export async function request<T = Record<string, unknown>>(method: string, path:
   let data: Record<string, unknown> = {};
   try {
     data = (await res.json()) as Record<string, unknown>;
-  } catch {
+  } catch (e) {
+    if (signal?.aborted) throw e;
     if (res.status >= 500 || res.status === 0) throw new Unreachable(`HTTP ${res.status}`);
+    if (strict && res.ok && generation === started) throw new Unreadable(`HTTP ${res.status}: ${String(e)}`);
   }
   // An answer is used only by the account and sign-in it was asked for (PROTOCOL §12).
   if (generation !== started) throw new DOMException("The account changed.", "AbortError");

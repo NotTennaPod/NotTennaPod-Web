@@ -1,7 +1,8 @@
 // Settings: the account (Android's Synchronization page for this server):
 // who is logged in, the account's devices with removal, password change,
 // diagnostics, the account's import, logging out (warning about changes not
-// yet sent), and the administrators' account management (PROTOCOL §5 API).
+// yet sent), and the administrators' account management (PROTOCOL §5 API) and
+// service page (backups, with Back up now, and the recovery key).
 import { useEffect, useRef, useState } from "preact/hooks";
 import { t, w } from "../i18n.ts";
 import { ApiError, get, post, request } from "../api/http.ts";
@@ -10,10 +11,13 @@ import { signOut } from "../app/boot.ts";
 import { useSync } from "../app/context.ts";
 import { useView, useValue } from "../app/useView.ts";
 import { Confirm, Loading, Menu, Toolbar } from "../ui/components.tsx";
-import { ImportReport, type ImportStatus } from "../ui/ImportReport.tsx";
+import { ImportProgress, useImportJob } from "../ui/ImportProgress.tsx";
+import { detach as detachImport } from "../app/importJob.ts";
 import { recoveryProblems, recoveryState, type RecoveryProblem, type RecoveryState } from "../journal/recovery.ts";
-import { formatAbbrev } from "../ui/format.ts";
+import { bytes, formatAbbrev } from "../ui/format.ts";
 import { leavePlayer } from "../player/instance.ts";
+import { RecoveryKeyDialog } from "../ui/RecoveryKeyDialog.tsx";
+import { onSaved as onRecoveryKeySaved, recoveryKeySaved } from "../ui/recoveryKey.ts";
 
 function Devices({ devices, onChange }: { devices: Installation[]; onChange: () => void }) {
   const [removing, setRemoving] = useState<Installation>();
@@ -107,7 +111,7 @@ function Diagnostics() {
   const rejections = (data?.rejections as { type: string; reason: string; op_id: string }[]) ?? [];
   const refresh = (data?.refresh_errors as { title: string; status: { error: { label: string } } }[]) ?? [];
   return (
-    <section class="settings-group">
+    <section class="settings-group diagnostics">
       <h2>{w("diagnostics_label")}</h2>
       {rejections.length === 0 && refresh.length === 0 && kept.length === 0 && <p class="secondary">—</p>}
       <ul>
@@ -279,6 +283,12 @@ function Accounts() {
   );
 }
 
+/** Use is how many copies of a kind the server keeps, and their bytes. */
+interface Use {
+  count: number;
+  bytes: number;
+}
+
 interface ServiceReport {
   version: string;
   uptime_seconds: number;
@@ -300,14 +310,12 @@ interface ServiceReport {
     write_check: string;
   } | null;
   refresh?: { due_now: number; running: number; last_wake: number };
+  /** The copies never deleted automatically (older servers send neither). */
+  manual_backups?: Use;
+  pre_restore?: Use;
   warnings: string[];
 }
 
-function bytes(n: number): string {
-  if (n >= 1 << 30) return `${(n / (1 << 30)).toFixed(1)} GB`;
-  if (n >= 1 << 20) return `${(n / (1 << 20)).toFixed(1)} MB`;
-  return `${Math.max(1, Math.round(n / 1024))} KB`;
-}
 
 function since(seconds: number): string {
   const d = Math.floor(seconds / 86400);
@@ -320,11 +328,59 @@ function when(ms: number): string {
   return ms > 0 ? new Date(ms).toLocaleString() : w("server_never");
 }
 
+/**
+ * BackupNow takes an on-demand backup (PROTOCOL §11.2): the button is disabled
+ * while it runs, then it says what was made, or the server's reason (too
+ * little free space, a backup already running).
+ */
+function BackupNow({ onDone }: { onDone: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<{ ok: boolean; text: string }>();
+  const run = () => {
+    setBusy(true);
+    setResult(undefined);
+    post<{ file: string; size: number }>("/v1/admin/backup")
+      .then(
+        (r) => {
+          setResult({ ok: true, text: w("server_backed_up", r.file, bytes(r.size)) });
+          onDone();
+        },
+        (err: unknown) => {
+          if (err instanceof DOMException && err.name === "AbortError") return; // signed out meanwhile
+          setResult({ ok: false, text: err instanceof ApiError ? err.message : w("recovery_key_unreachable") });
+        },
+      )
+      .finally(() => setBusy(false));
+  };
+  return (
+    <div class="server-backup-now">
+      <button class="outlined-button" disabled={busy} aria-busy={busy} onClick={run}>
+        {w("server_backup_now")}
+      </button>
+      {busy && <progress class="dialog-progress" aria-label={t("please_wait")} />}
+      {result &&
+        (result.ok ? (
+          <p role="status" dir="auto">
+            {result.text}
+          </p>
+        ) : (
+          <p class="dialog-error" role="alert" dir="auto">
+            {result.text}
+          </p>
+        ))}
+    </div>
+  );
+}
+
 /** ServerSection is the service page (PROTOCOL §14): how the server is doing, and how to run it. */
 function ServerSection() {
+  const sync = useSync();
   const [r, setR] = useState<ServiceReport>();
+  const [saving, setSaving] = useState(false);
+  const reload = () => get<ServiceReport>("/v1/admin/service").then(setR, () => {});
   useEffect(() => {
-    get<ServiceReport>("/v1/admin/service").then(setR, () => {});
+    void reload();
+    return onRecoveryKeySaved(() => void reload());
   }, []);
   if (!r) return null;
   const b = r.backups;
@@ -355,12 +411,37 @@ function ServerSection() {
           )}
         </>
       )}
+      {!!r.manual_backups?.count && <p dir="auto">{w("server_manual_backups", String(r.manual_backups.count), bytes(r.manual_backups.bytes))}</p>}
+      {!!r.pre_restore?.count && <p dir="auto">{w("server_pre_restore", String(r.pre_restore.count), bytes(r.pre_restore.bytes))}</p>}
+      <BackupNow onDone={() => void reload()} />
       {r.keys_exported_at ? (
-        <p>{w("server_keys_exported", when(r.keys_exported_at))}</p>
+        <div class="server-keys">
+          <p dir="auto">{w("server_keys_exported", when(r.keys_exported_at))}</p>
+          <button class="outlined-button" onClick={() => setSaving(true)}>
+            {w("server_keys_save_again")}
+          </button>
+        </div>
       ) : (
-        <p class="dialog-error" role="alert">
-          {w("server_keys_not_exported")}
-        </p>
+        <div class="server-keys">
+          <p class="dialog-error" role="alert" dir="auto">
+            {w("server_keys_not_exported")}
+          </p>
+          <button class="outlined-button" onClick={() => setSaving(true)}>
+            {w("server_keys_save")}
+          </button>
+        </div>
+      )}
+      {saving && (
+        <RecoveryKeyDialog
+          onClose={() => {
+            setSaving(false);
+            void reload(); // a confirmation given up on may still have reached the server
+          }}
+          onSaved={() => {
+            setSaving(false);
+            recoveryKeySaved(sync);
+          }}
+        />
       )}
       {r.refresh && <p>{w("server_refresh", String(r.refresh.due_now), when(r.refresh.last_wake))}</p>}
       {warnings.length > 0 && (
@@ -386,17 +467,14 @@ function ServerSection() {
   );
 }
 
-/** ImportSection shows the account's import and its report, also after a reload. */
-function ImportSection({ id }: { id: string }) {
-  const [status, setStatus] = useState<ImportStatus>();
-  useEffect(() => {
-    get<ImportStatus>(`/v1/import/${encodeURIComponent(id)}`).then(setStatus, () => {});
-  }, [id]);
-  if (!status) return null;
+/** ImportSection shows the account's import, its progress and its report (the tab's import job), also after a reload. */
+function ImportSection() {
+  const view = useImportJob();
+  if (view.state.k === "idle" && !view.notice) return null;
   return (
     <section class="settings-group">
       <h2>{w("import_label")}</h2>
-      <ImportReport status={status} />
+      <ImportProgress view={view} />
     </section>
   );
 }
@@ -441,10 +519,14 @@ export function Settings() {
     setConfirmOut(false);
     setOutBusy(true);
     setOutFailed(undefined);
-    // The player's last save is made under this account, and sent if the server takes it in time.
+    // The player's last save is made under this account, and sent if the server takes it in time;
+    // the import's job stops before the sign-out (its chunks stay on the server for this account).
     leavePlayer(sync)
       .then(() => sync.pushed(3000))
-      .then(() => signOut())
+      .then(() => {
+        detachImport();
+        return signOut();
+      })
       .then(
       () => location.assign("/"),
       (err: unknown) => {
@@ -470,7 +552,7 @@ export function Settings() {
       </section>
       <Recovery />
       {!view.data ? <Loading /> : <Devices devices={view.data.installations} onChange={view.reload} />}
-      {view.data?.import && <ImportSection id={view.data.import.import_id} />}
+      <ImportSection />
       <Password />
       <Diagnostics />
       {account.is_admin && <Accounts />}

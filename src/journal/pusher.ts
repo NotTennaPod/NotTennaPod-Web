@@ -4,8 +4,9 @@
 // version_unsupported pausing pushes while reads continue, and facts above
 // the unframed bound sent in parts, one part per request.
 import { ApiError } from "../api/http.ts";
+import { resplit } from "../app/actions.ts";
 import { req, tx, type EntryRow, type InstallationRow, type Receipt } from "./db.ts";
-import { acknowledge, framingOf, markWaiting, recordParts, unacknowledged, updateInstallation } from "./journal.ts";
+import { acknowledge, framingOf, markWaiting, maxFactBytes, maxUnframedFactBytes, recordParts, replaceEntry, unacknowledged, updateInstallation } from "./journal.ts";
 import { base64url, canonical, contentHash, utf8 } from "./jcs.ts";
 
 export interface PushResult {
@@ -28,14 +29,16 @@ export interface Bounds {
   max_unframed_fact_bytes: number;
   max_part_bytes: number;
   max_part_count: number;
+  max_framed_fact_bytes?: number; // absent: max_part_count parts
 }
 
 export const defaultBounds: Bounds = {
   max_operations: 500,
   max_request_bytes: 4 << 20,
-  max_unframed_fact_bytes: 256 << 10,
+  max_unframed_fact_bytes: maxUnframedFactBytes,
   max_part_bytes: 256 << 10,
   max_part_count: 64,
+  max_framed_fact_bytes: maxFactBytes,
 };
 
 export type Transport = (body: Record<string, unknown>) => Promise<PushResponse>;
@@ -44,7 +47,8 @@ export interface PushOutcome {
   acknowledged: number;
   remaining: number;
   waiting: string[] | null; // dependencies the server waits for
-  stopped: null | "paused" | "no_cursor" | "unregistered" | "conflict" | "lineage_mismatch" | "lineage_unknown";
+  /** too_large: an unsent entry no request can carry, of an action that cannot be split; it and the entries after it are kept. */
+  stopped: null | "paused" | "no_cursor" | "unregistered" | "conflict" | "lineage_mismatch" | "lineage_unknown" | "too_large";
   partsStored?: boolean; // a framed fact made progress
 }
 
@@ -82,11 +86,13 @@ export function decodeCursor(cursor: string): { log_id: string; epoch: number; s
   return { log_id: v.log_id as string, epoch: v.epoch as number, seq: v.seq as number };
 }
 
+/** sendable tells whether a fact of this many canonical bytes fits the server's framing bounds. */
+const sendable = (size: number, bounds: Bounds) => Math.ceil(size / bounds.max_part_bytes) <= bounds.max_part_count && size <= (bounds.max_framed_fact_bytes ?? Infinity);
+
 async function partsOf(db: IDBDatabase, e: EntryRow, bounds: Bounds): Promise<{ transaction_id: string; present: number[]; hash: string; parts: Uint8Array[] }> {
   const bytes = utf8(canonical(e.fact));
   const parts: Uint8Array[] = [];
   for (let i = 0; i < bytes.length; i += bounds.max_part_bytes) parts.push(bytes.subarray(i, i + bounds.max_part_bytes));
-  if (parts.length > bounds.max_part_count) throw new Error("journal: a fact is larger than the server accepts");
   const f = await framingOf(db, e.account_id, e.install_seq);
   if (!f) throw new Error("journal: the entry is gone");
   return { transaction_id: f.transaction_id, present: f.present, hash: await contentHash(e.fact), parts };
@@ -115,6 +121,15 @@ export async function pushOnce(db: IDBDatabase, account: string, send: Transport
     const size = utf8(canonical(e.fact)).length;
     if (size > bounds.max_unframed_fact_bytes) {
       if (operations.length > 0) break; // a framed fact goes alone
+      if (!sendable(size, bounds)) {
+        // An action an earlier version journaled as one fact, before list actions
+        // were split: it becomes the facts this version journals for it, in its
+        // place, and is sent as they are. One that cannot be split is kept, and
+        // so is everything after it; the tab says the changes cannot be sent.
+        const parts = resplit(e.fact);
+        if (!parts || !(await replaceEntry(db, account, e, parts))) return { ...out, stopped: "too_large" };
+        return pushOnce(db, account, send, bounds);
+      }
       const { transaction_id, present, hash, parts } = await partsOf(db, e, bounds);
       const index = parts.findIndex((_, i) => !present.includes(i));
       const i = index < 0 ? parts.length - 1 : index;

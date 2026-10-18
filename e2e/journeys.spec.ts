@@ -5,10 +5,11 @@
 // arriving by event. Every action is checked on the server through the read
 // API, not only on screen.
 import { expect, test, type Page, type BrowserContext, type Response as Answer } from "@playwright/test";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { serverRepo } from "./support/build.ts";
 import { startFeeds, startServer, type Feeds, type RunningServer } from "./support/server.ts";
+import { notNow } from "./support/offer.ts";
 
 test.describe.configure({ mode: "serial" });
 
@@ -94,6 +95,7 @@ test("set up, log out and log in", async () => {
   await page.getByLabel("Password").fill(password);
   await page.getByRole("button", { name: "Create account" }).click();
   await expect(page.locator("nav.drawer")).toBeVisible();
+  await notNow(page);
   await page.goto(server.base + "/settings");
   // A logout the server does not confirm keeps the session, and says so.
   for (const answer of [{ status: 503, body: "" }, { status: 503, body: '{"error":"server_busy","message":"Try again."}' }]) {
@@ -110,6 +112,22 @@ test("set up, log out and log in", async () => {
   await page.getByLabel("Password").fill(password);
   await page.getByRole("button", { name: "Log in" }).click();
   await expect(page.locator("nav.drawer")).toBeVisible();
+});
+
+test("the import rows are reached with Tab, and Enter opens each one's file chooser", async ({ browserName }) => {
+  // Safari's Tab skips buttons unless the person turned that on; Option+Tab reaches them.
+  const tab = browserName === "webkit" ? "Alt+Tab" : "Tab";
+  await page.goto(server.base + "/add");
+  await page.getByLabel("Add podcast by RSS address").focus();
+  for (const [name, accept] of [["Import podcast list (OPML)", /^\.opml/], ["Database import", /^\.db/]] as const) {
+    const row = page.getByRole("button", { name, exact: true });
+    await expect(row).toBeVisible();
+    for (let i = 0; i < 10 && !(await row.evaluate((el) => el === document.activeElement)); i++) await page.keyboard.press(tab);
+    await expect(row).toBeFocused();
+    const chooser = page.waitForEvent("filechooser");
+    await page.keyboard.press("Enter");
+    expect(await (await chooser).element().getAttribute("accept")).toMatch(accept);
+  }
 });
 
 test("an import whose file cannot be read says so; a path that does not decode is not found", async () => {
@@ -137,6 +155,10 @@ test("import an Android backup into the empty account", async () => {
   await page.locator("input[type=file][accept^='.db']").setInputFiles({ name: "AntennaPodBackup.db", mimeType: "application/octet-stream", buffer: readFileSync(file) });
   await expect(page.getByText("The AntennaPod backup imported.")).toBeVisible({ timeout: 60_000 });
   await expect(page.getByText(/^Imported \d+ podcasts and \d+ episodes: 9 in the queue/)).toBeVisible();
+  // The podcasts whose settings stay on the device the backup came from (seven in this library) are listed.
+  await page.getByText("Podcast settings not imported (7)").click();
+  // Four of its feeds share a title: each is told apart by its address.
+  await expect(page.getByText(/^Automatic download lab \(https?:\/\/\S+\): Include in auto downloads, Episode filter$/)).toHaveCount(4);
   const summary = await read<{ counters: { queue: number; inbox: number } }>("/v1/read/summary");
   expect(summary.counters).toEqual({ queue: 9, inbox: 1 });
   await page.goto(server.base + "/queue");
@@ -362,6 +384,37 @@ test("subscribe from an address", async () => {
   await expect(page.locator(".episode-title", { hasText: "Journey episode 1" })).toBeVisible({ timeout: 30_000 });
 });
 
+test("a podcast unsubscribed here is added again from its address, and opens fresh", async () => {
+  const id = (await subscription("Journey Show"))!.podcast_id;
+  // A favorite of the podcast as it was, which a re-add does not bring back.
+  await page.goto(`${server.base}/podcast/${encodeURIComponent(id)}`);
+  await menu(page.locator(".episode", { hasText: "Journey episode 1" }), "Add to favorites");
+  await expect.poll(async () => (await episodes("/v1/read/favorites")).map((e) => e.title)).toContain("Journey episode 1");
+  // Unsubscribe through Android's dialog (asked once more).
+  await page.locator(".toolbar").getByRole("button", { name: "More" }).click();
+  await page.getByRole("menuitem", { name: "Unsubscribe / archive" }).click();
+  const remove = page.getByRole("dialog", { name: "Unsubscribe / archive" });
+  await remove.getByRole("button", { name: "Unsubscribe" }).click();
+  await remove.getByRole("button", { name: "Unsubscribe" }).click();
+  await expect.poll(async () => (await subscription("Journey Show"))?.podcast_id ?? "").toBe("");
+  // The same address again: the preview offers Subscribe, not a podcast that cannot open.
+  await page.goto(server.base + "/add");
+  await page.getByLabel("Add podcast by RSS address").fill(feeds.url);
+  await page.getByRole("button", { name: "Episodes preview" }).click();
+  await expect(page.getByRole("heading", { name: "Journey Show" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Open podcast" })).toHaveCount(0);
+  await page.getByRole("button", { name: "Subscribe", exact: true }).click();
+  // The same podcast, fresh: it opens with its episodes, and the old favorite stays gone.
+  await expect.poll(async () => (await subscription("Journey Show"))?.podcast_id ?? "", { timeout: 60_000 }).toBe(id);
+  await settled();
+  const resubscribe = pushed.filter((f) => f.type === "podcast.subscribe" && f.payload.observed).at(-1);
+  expect(resubscribe?.outcome).toBe("applied");
+  await page.goto(`${server.base}/podcast/${encodeURIComponent(id)}`);
+  await expect(page.locator(".toolbar h1")).toHaveText("Journey Show");
+  await expect(page.locator(".episode-title", { hasText: "Journey episode 1" })).toBeVisible({ timeout: 30_000 });
+  expect((await episodes("/v1/read/favorites")).map((e) => e.title)).not.toContain("Journey episode 1");
+});
+
 test("a private feed's login longer than the server keeps is refused before anything is saved; a refused push says so", async () => {
   await page.goto(server.base + "/add");
   await page.getByLabel("Add podcast by RSS address").fill(feeds.url.replace("feed.xml", "private.xml"));
@@ -557,9 +610,64 @@ test("the administrator's Server section shows the backups, the keys and how to 
   const section = page.locator(".server-section");
   await expect(section.getByRole("heading", { name: "Server" })).toBeVisible();
   await expect(section.getByText(/^Daily backups in .+: \d+ kept/)).toBeVisible();
-  await expect(section.getByText(/keys have never been exported/)).toBeVisible();
+  await expect(section.getByText(/^This server has no saved recovery key\./)).toBeVisible();
   await section.getByText("Instructions").click();
   await expect(section.getByText(/tailscale serve --bg http:\/\/127\.0\.0\.1:8080/)).toBeVisible();
+});
+
+test("Server section: Back up now makes a compressed backup, and the copies never deleted automatically are listed", async () => {
+  await page.goto(server.base + "/settings");
+  const section = page.locator(".server-section");
+  const now = section.locator(".server-backup-now");
+  const backUp = now.getByRole("button", { name: "Back up now" });
+  await expect(backUp).toBeEnabled();
+  await expect(section.getByText(/^Backups taken by hand/)).toHaveCount(0);
+  await expect(section.getByText(/^Databases kept by restores/)).toHaveCount(0);
+  // Too little free space: the server's own words, and nothing made.
+  const refusal = "The backup was not made: not enough free space for a backup: 900 MB free, 1100 MB needed. Older backups are kept.";
+  await page.route("**/v1/admin/backup", (r) => r.fulfill({ status: 507, json: { error: "insufficient_space", message: refusal } }));
+  await backUp.click();
+  await expect(now.getByRole("alert")).toHaveText(refusal);
+  await page.unroute("**/v1/admin/backup");
+  // Another backup running.
+  await page.route("**/v1/admin/backup", (r) =>
+    r.fulfill({ status: 409, json: { error: "backup_running", message: "A backup is already running; try again when it has finished." } }),
+  );
+  await backUp.click();
+  await expect(now.getByRole("alert")).toHaveText("A backup is already running; try again when it has finished.");
+  await page.unroute("**/v1/admin/backup");
+  // A real backup, held on its way to the server: the button waits, then says what was made.
+  let release!: () => void;
+  const held = new Promise<void>((r) => (release = r));
+  await page.route("**/v1/admin/backup", async (r) => {
+    await held;
+    await r.continue();
+  });
+  await backUp.click();
+  await expect(backUp).toBeDisabled();
+  await expect(now.getByRole("alert")).toHaveCount(0);
+  release();
+  const made = now.getByRole("status").filter({ hasText: /^Backed up: nottennapod-\d{8}-\d{6}-\d+\.db\.gz \(\d+(\.\d)? [KMG]B\)\.$/ });
+  await expect(made).toBeVisible();
+  await expect(backUp).toBeEnabled();
+  await page.unroute("**/v1/admin/backup");
+  const file = (await made.textContent())!.match(/nottennapod-\S+\.db\.gz/)![0];
+  expect(readdirSync(join(server.dataDir, "backups"))).toContain(file);
+  await expect(section.getByText(/^Backups taken by hand: 1 \(\d+(\.\d)? [KMG]B\)\. They are never deleted automatically\.$/)).toBeVisible();
+  // A database a restore kept in the data folder.
+  const kept = join(server.dataDir, "nottennapod.db.pre-restore-20261001-000000");
+  writeFileSync(kept, Buffer.alloc(3 << 20));
+  try {
+    await page.reload();
+    await expect(
+      section.getByText(
+        "Databases kept by restores: 1 (3.0 MB), in the data folder. They are never deleted automatically; delete them yourself when you no longer need them.",
+      ),
+    ).toBeVisible();
+    await expect(section.getByText(/^Backups taken by hand: 1 /)).toBeVisible();
+  } finally {
+    rmSync(kept, { force: true });
+  }
 });
 
 test("subscriptions: a tile's right-click menu, multi select, Keep updated for several, then archive and restore", async () => {
@@ -653,5 +761,232 @@ test("an account disabled while its page is open leaves that page signed out, wi
     expect(streams, "the stream is not reopened again and again").toBeLessThanOrEqual(1);
   } finally {
     await other.close();
+  }
+});
+
+// The feed-error journeys: Breakable Show, a feed the publisher breaks and mends. The account holds other
+// podcasts, some of whose feeds fail too, so every check is of Breakable Show's own tile, row and screen.
+const notice = "Last refresh failed. Tap to view details.";
+const brokenStatus =
+  "The podcast host's server sent a broken podcast feed. We recommend checking with a podcast validator such as castfeedvalidator.com and contacting the podcast creator to let them know.";
+type FeedRow = { podcast_id: string; display_title: string; records: { refresh_status?: { value: { error: { label: string } | null } } } };
+const subscription = async (title: string) => (await read<{ items: FeedRow[] }>("/v1/read/subscriptions?limit=500")).items.find((p) => p.display_title === title);
+const refreshError = async (title: string) => (await subscription(title))?.records.refresh_status?.value.error?.label ?? "";
+const refreshPodcast = (id: string) =>
+  page.evaluate(async (id) => (await fetch("/v1/refresh", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ podcast_id: id }) })).status, id);
+
+/** subscribeTo subscribes to a fixture feed (once) and waits for the server's first fetch; it is the podcast's ID. */
+async function subscribeTo(url: string, title: string): Promise<string> {
+  if (!(await subscription(title))) {
+    await page.goto(server.base + "/add");
+    await page.getByLabel("Add podcast by RSS address").fill(url);
+    await page.getByRole("button", { name: "Episodes preview" }).click();
+    await expect(page.getByRole("heading", { name: title })).toBeVisible();
+    await page.getByRole("button", { name: "Subscribe", exact: true }).click();
+  }
+  let id = "";
+  await expect.poll(async () => (id = (await subscription(title))?.podcast_id ?? ""), { timeout: 60_000 }).not.toBe("");
+  await expect
+    .poll(async () => (await read<{ total: number }>(`/v1/read/podcasts/${encodeURIComponent(id)}/episodes`)).total, { timeout: 60_000 })
+    .toBe(3);
+  return id;
+}
+
+/** breakFeed has the publisher break Breakable Show's feed, and waits for the server's refresh to fail. */
+async function breakFeed(): Promise<string> {
+  feeds.breakable.setBroken(false);
+  const id = await subscribeTo(feeds.breakable.url, "Breakable Show");
+  feeds.breakable.setBroken(true);
+  expect(await refreshPodcast(id)).toBe(202);
+  await expect.poll(() => refreshError("Breakable Show"), { timeout: 60_000 }).toBe("parser_exception");
+  return id;
+}
+
+/** mendFeed has the publisher fix it, and waits for the server's refresh to work. */
+async function mendFeed(id: string): Promise<void> {
+  feeds.breakable.setBroken(false);
+  expect(await refreshPodcast(id)).toBe(202);
+  await expect.poll(() => refreshError("Breakable Show"), { timeout: 60_000 }).toBe("");
+}
+
+test("a podcast whose feed fails shows Android's error icon, notice and details, and they go when it works again", async ({ browserName }) => {
+  // Subscribed while the feed works, then the publisher breaks it and the next refresh fails.
+  feeds.breakable.setBroken(false);
+  const id = await subscribeTo(feeds.breakable.url, "Breakable Show");
+  expect(await refreshError("Breakable Show")).toBe("");
+  await breakFeed();
+
+  // The Subscriptions tile: Android's error icon at the cover's bottom-end, red on the window's colour, and the
+  // tile named with the notice for screen readers.
+  await page.goto(server.base + "/subscriptions");
+  const tile = page.locator(".subscription-grid").getByRole("link", { name: `Breakable Show, ${notice}`, exact: true });
+  await expect(tile).toBeVisible();
+  const icon = tile.locator(".subscription-error svg");
+  await expect(icon).toBeVisible();
+  const fills = await icon.locator("path").evaluateAll((ps) => ps.map((p) => getComputedStyle(p).fill));
+  expect(fills[1]).toBe("rgb(207, 24, 0)");
+  expect(fills[0]).not.toBe(fills[1]);
+  await expect(tile.locator(".subscription-error")).toHaveCount(1);
+  // The drawer's row: the icon before the counter, named.
+  const drawerRow = page.locator(".nav-subscriptions a").filter({ hasText: "Breakable Show" });
+  await expect(drawerRow.getByRole("img", { name: notice, exact: true })).toBeVisible();
+
+  // The podcast's notice opens Android's details: the podcast, the status in Android's words, no technical
+  // details for this failure, and the feed's address.
+  await tile.click();
+  const button = page.getByRole("button", { name: notice, exact: true });
+  await expect(button).toBeVisible();
+  await button.click();
+  const dialog = page.getByRole("dialog", { name: "Details" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator("dt")).toHaveText(["Podcast", "Status", "Technical details", "File URL"]);
+  await expect(dialog.locator("dd")).toHaveText(["Breakable Show", brokenStatus, "", feeds.breakable.url]);
+  await expect(dialog.getByRole("button")).toHaveText([feeds.breakable.url, "Copy to clipboard", "OK"]);
+  // OK closes it and gives the keyboard back to the notice; Escape closes it too.
+  await dialog.getByRole("button", { name: "OK", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect(button).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "OK", exact: true })).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await expect(button).toBeFocused();
+  // Copy to clipboard copies Android's text and closes the dialog.
+  if (browserName === "chromium") await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: server.base });
+  await button.click();
+  await dialog.getByRole("button", { name: "Copy to clipboard" }).click();
+  await expect(dialog).toHaveCount(0);
+  if (browserName === "chromium") expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(copiedDetails());
+  await expect(page.locator(".snackbar").filter({ hasText: "Copied to clipboard" }).first()).toBeVisible();
+
+  // The publisher fixes the feed: the next refresh works, and the notice and icons go, without a reload.
+  await mendFeed(id);
+  await expect(button).toHaveCount(0, { timeout: 60_000 });
+  await expect(drawerRow.getByRole("img", { name: notice })).toHaveCount(0);
+  await page.goto(server.base + "/subscriptions");
+  const healthyTile = page.locator(".subscription-grid").getByRole("link", { name: "Breakable Show", exact: true });
+  await expect(healthyTile).toBeVisible();
+  await expect(healthyTile.locator(".subscription-error")).toHaveCount(0);
+});
+
+/** copiedDetails is what Copy to clipboard copies for Breakable Show's broken feed (Android's text). */
+const copiedDetails = () => `Status: \n${brokenStatus} \n\nTechnical details: \nnull \n\nFile URL: \n${feeds.breakable.url}`;
+
+test("when a feed fails, its details never show on another podcast after Back and Forward", async () => {
+  const healthy = await subscribeTo(feeds.url, "Journey Show");
+  const failing = await breakFeed();
+  try {
+    await page.goto(`${server.base}/podcast/${encodeURIComponent(healthy)}`);
+    await expect(page.locator(".toolbar h1")).toHaveText("Journey Show");
+    // The failing podcast through the drawer (the same screen, another podcast), and its details.
+    await page.locator(".nav-subscriptions a").filter({ hasText: "Breakable Show" }).click();
+    await expect(page.locator(".toolbar h1")).toHaveText("Breakable Show");
+    await page.getByRole("button", { name: notice, exact: true }).click();
+    const dialog = page.getByRole("dialog", { name: "Details" });
+    await expect(dialog.locator("dd")).toHaveText(["Breakable Show", brokenStatus, "", feeds.breakable.url]);
+    // Back: the healthy podcast, with no details at all (its screen shows with any dialog it keeps).
+    await page.goBack();
+    await expect(page.locator(".toolbar h1")).toHaveText("Journey Show");
+    await expect(page.locator("dialog")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: notice })).toHaveCount(0);
+    await expect(page.getByText(brokenStatus)).toHaveCount(0);
+    // Forward: the failing podcast again, its details closed until asked for, then its own.
+    await page.goForward();
+    await expect(page.locator(".toolbar h1")).toHaveText("Breakable Show");
+    await expect(page.getByRole("button", { name: notice, exact: true })).toBeVisible();
+    await expect(page.locator("dialog")).toHaveCount(0);
+    await page.getByRole("button", { name: notice, exact: true }).click();
+    await expect(dialog.locator("dd")).toHaveText(["Breakable Show", brokenStatus, "", feeds.breakable.url]);
+    await page.keyboard.press("Escape");
+    await expect(dialog).toHaveCount(0);
+  } finally {
+    await mendFeed(failing);
+  }
+});
+
+test("when a feed fails, its details are copied even if the browser refuses or lacks the clipboard API", async ({ browserName }) => {
+  const id = await breakFeed();
+  const chromium = browserName === "chromium";
+  if (chromium) await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: server.base });
+  const clipboard = () => page.evaluate(() => (window as unknown as { realClipboard: Clipboard }).realClipboard.readText());
+  try {
+    await page.goto(`${server.base}/podcast/${encodeURIComponent(id)}`);
+    const button = page.getByRole("button", { name: notice, exact: true });
+    const dialog = page.getByRole("dialog", { name: "Details" });
+    const failed = dialog.getByRole("alert");
+    await expect(button).toBeVisible();
+    // What each copy command copied (the selection it copies), each snackbar shown, and the clipboard API as it was.
+    await page.evaluate(() => {
+      const w = window as unknown as { copies: string[]; notices: string[]; realClipboard: Clipboard };
+      w.copies = [];
+      w.notices = [];
+      w.realClipboard = navigator.clipboard;
+      new MutationObserver((changes) => {
+        for (const c of changes) for (const n of c.addedNodes) if (n instanceof HTMLElement && n.matches(".snackbar")) w.notices.push(n.innerText);
+      }).observe(document.querySelector(".snackbars")!, { childList: true });
+      document.addEventListener(
+        "copy",
+        () => {
+          const el = document.activeElement as HTMLTextAreaElement | null;
+          w.copies.push(el?.tagName === "TEXTAREA" ? el.value.slice(el.selectionStart, el.selectionEnd) : String(getSelection()));
+        },
+        true,
+      );
+    });
+    const copies = () => page.evaluate(() => (window as unknown as { copies: string[] }).copies);
+    const notices = () => page.evaluate(() => (window as unknown as { notices: string[] }).notices);
+    const sentinel = async () => {
+      if (chromium) await page.evaluate(() => Clipboard.prototype.writeText.call((window as unknown as { realClipboard: Clipboard }).realClipboard, "sentinel"));
+      await page.evaluate(() => {
+        const w = window as unknown as { copies: string[]; notices: string[] };
+        w.copies = [];
+        w.notices = [];
+      });
+    };
+    /** copied checks a copy that worked: what was copied, on the clipboard where the browser lets it be read, and said. */
+    const copied = async (text: string) => {
+      await expect.poll(copies).toEqual([text]);
+      if (chromium) expect(await clipboard()).toBe(text);
+      await expect.poll(notices).toEqual(["Copied to clipboard"]);
+    };
+
+    // The browser refuses the clipboard API (a permission refused, later), then has none at all (a plain-HTTP
+    // origin): the dialog stays until the copy is over, and copies a selection of the text instead.
+    await page.evaluate(() => {
+      navigator.clipboard.writeText = () => new Promise((_, reject) => setTimeout(() => reject(new DOMException("Write permission denied.", "NotAllowedError")), 50));
+    });
+    for (const how of ["refused", "missing"] as const) {
+      if (how === "missing") await page.evaluate(() => Object.defineProperty(navigator, "clipboard", { value: undefined, configurable: true }));
+      await sentinel();
+      await button.click();
+      await dialog.getByRole("button", { name: "Copy to clipboard" }).click();
+      await copied(copiedDetails());
+      await expect(dialog).toHaveCount(0);
+      // One value alone, from the keyboard: copied, and the keyboard stays on it.
+      await sentinel();
+      await button.click();
+      const address = dialog.getByRole("button", { name: feeds.breakable.url });
+      await address.focus();
+      await page.keyboard.press("Enter");
+      await copied(feeds.breakable.url);
+      await expect(address).toBeFocused();
+      await page.keyboard.press("Escape");
+      await expect(dialog).toHaveCount(0);
+    }
+    // A browser that lets nothing be copied at all: the dialog says so and stays, and never says it copied.
+    await page.evaluate(() => (document.execCommand = () => false));
+    await sentinel();
+    await button.click();
+    await dialog.getByRole("button", { name: "Copy to clipboard" }).click();
+    await expect(failed).toHaveText("Could not copy to the clipboard.");
+    await expect(dialog).toBeVisible();
+    expect(await notices()).toEqual([]);
+    if (chromium) expect(await clipboard()).toBe("sentinel");
+    await dialog.getByRole("button", { name: "OK", exact: true }).click();
+    await expect(dialog).toHaveCount(0);
+  } finally {
+    await page.reload();
+    await mendFeed(id);
   }
 });

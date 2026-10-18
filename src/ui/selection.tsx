@@ -62,69 +62,139 @@ export interface Selection<T = EpisodeRow> {
   /** click toggles a row, or with `range` selects from the last clicked row to this one. */
   click(id: string, range: boolean): void;
   end(): void;
-  /** selected are the loaded rows selected, in list order. */
+  /** selected are the rows selected that are known here (loaded, or picked one by one), in list order. */
   selected: T[];
-  /** lazy: Select all or Select all below also takes the rows not loaded yet. */
+  /** lazy: the selection takes rows not loaded (Select all, Select all above or below). */
   lazy: boolean;
   count: number;
+  /**
+   * resolve is what an action applies to, in list order: the rows picked, and
+   * the rows of each range Select all, above and below took, but those
+   * deselected since; rows not loaded are found by walking the whole view
+   * (`walk`, in list order) the selection was made on.
+   */
+  resolve(walk: () => Promise<T[]>): Promise<T[]>;
 }
 
 /**
- * useSelection keeps a list's selection: by episode, so a reload keeps it,
- * and `total` counts the rows not loaded yet (Android's totalNumberOfItems).
+ * The selection's state, in indexes of the view it is made on (Android's
+ * SelectableAdapter, whose positions are the list's): the rows picked one by
+ * one, the ranges Select all, above and below took (Android's lazily loaded
+ * rows included), and the rows deselected within those ranges since.
  */
-export function useSelection<T = EpisodeRow>(items: T[] | undefined, total: number, idOf: (x: T) => string = (x) => (x as EpisodeRow).episode_id): Selection<T> {
-  const [ids, setIds] = useState<Set<string> | null>(null);
-  const [lazy, setLazy] = useState(false);
+interface Picked<T> {
+  picked: Map<string, { row: T; i: number }>;
+  ranges: [number, number][];
+  excluded: Map<string, number>;
+}
+
+/** spanOf is how many indexes ranges cover together, within [0, total). */
+function spanOf(ranges: [number, number][], total: number): number {
+  const sorted = ranges.map(([a, b]): [number, number] => [Math.max(0, a), Math.min(total, b)]).filter(([a, b]) => b > a).sort((x, y) => x[0] - y[0]);
+  let n = 0;
+  let end = 0;
+  for (const [a, b] of sorted) {
+    const from = Math.max(a, end);
+    if (b > from) n += b - from;
+    end = Math.max(end, b);
+  }
+  return n;
+}
+
+/**
+ * useSelection keeps a list's selection by episode and by its place in the
+ * list: `offset` is the index of the first row of `items` (a window of the
+ * list), and `total` counts the rows not loaded (Android's totalNumberOfItems).
+ */
+export function useSelection<T = EpisodeRow>(
+  items: T[] | undefined,
+  total: number,
+  idOf: (x: T) => string = (x) => (x as EpisodeRow).episode_id,
+  offset = 0,
+): Selection<T> {
+  const [s, setS] = useState<Picked<T> | null>(null);
   const anchor = useRef<string | null>(null);
   const rows = items ?? [];
-  const active = ids !== null;
-  // After Select all or Select all below, rows loaded later are selected too (Android's
-  // shouldSelectLazyLoadedItems): they join the selection as they arrive.
-  const known = useRef<Set<string>>(new Set());
-  useEffect(() => {
-    if (!ids || !lazy) {
-      known.current = new Set(rows.map(idOf));
-      return;
-    }
-    const fresh = rows.map(idOf).filter((id) => !known.current.has(id));
-    known.current = new Set(rows.map(idOf));
-    if (fresh.length) setIds(new Set([...ids, ...fresh]));
-  }, [rows, ids, lazy]);
-  const selected = active ? rows.filter((e) => ids.has(idOf(e))) : [];
-  const count = selected.length + (lazy ? Math.max(0, total - rows.length) : 0);
+  const active = s !== null;
+  const indexOf = new Map(rows.map((r, k) => [idOf(r), offset + k]));
+  const inRange = (i: number) => !!s && s.ranges.some(([a, b]) => i >= a && i < b);
+  const selectedAt = (id: string, i: number) => !!s && !s.excluded.has(id) && (s.picked.has(id) || inRange(i));
+  const isSelected = (id: string) => {
+    const i = indexOf.get(id);
+    if (i !== undefined) return selectedAt(id, i);
+    const p = s?.picked.get(id);
+    return !!p && !s!.excluded.has(id);
+  };
+  // The rows known here: those loaded, and those picked one by one elsewhere in the list.
+  const known: { row: T; i: number }[] = rows.map((row, k) => ({ row, i: offset + k }));
+  if (s) for (const [id, p] of s.picked) if (!indexOf.has(id)) known.push(p);
+  known.sort((x, y) => x.i - y.i);
+  const selected = active ? known.filter((x) => selectedAt(idOf(x.row), x.i)).map((x) => x.row) : [];
+  let count = 0;
+  if (s) {
+    const n = Math.max(total, offset + rows.length);
+    count = spanOf(s.ranges, n);
+    for (const [, i] of s.excluded) if (inRange(i)) count--;
+    for (const [id, p] of s.picked) if (!s.excluded.has(id) && !inRange(p.i)) count++;
+  }
+  const loadedFrom = offset;
+  const loadedTo = offset + rows.length;
+  const lazy = !!s && s.ranges.some(([a, b]) => a < loadedFrom || Math.min(b, Math.max(total, loadedTo)) > loadedTo);
   const end = () => {
-    setIds(null);
-    setLazy(false);
+    setS(null);
     anchor.current = null;
   };
-  const set = (next: Set<string>) => (next.size === 0 ? end() : setIds(next));
+  /** change edits a copy of the state; nothing selected ends the mode (as a deselected last row does). */
+  const change = (edit: (p: Picked<T>) => void, endIfEmpty = true) => {
+    if (!s) return;
+    const n: Picked<T> = { picked: new Map(s.picked), ranges: [...s.ranges], excluded: new Map(s.excluded) };
+    edit(n);
+    const left = n.picked.size > 0 && [...n.picked.keys()].some((id) => !n.excluded.has(id));
+    if (endIfEmpty && !left && !n.ranges.length) end();
+    else setS(n);
+  };
+  const pick = (n: Picked<T>, row: T, i: number) => {
+    const id = idOf(row);
+    n.excluded.delete(id);
+    if (!n.ranges.some(([a, b]) => i >= a && i < b)) n.picked.set(id, { row, i });
+  };
   const sel: Selection<T> = {
     active,
-    isSelected: (id) => !!ids?.has(id),
+    isSelected,
     start(id) {
+      const k = rows.findIndex((e) => idOf(e) === id);
       anchor.current = id;
-      setLazy(false);
-      setIds(new Set([id]));
+      setS({ picked: k < 0 ? new Map() : new Map([[id, { row: rows[k]!, i: offset + k }]]), ranges: [], excluded: new Map() });
     },
     click(id, range) {
-      if (!ids) return;
-      const next = new Set(ids);
+      if (!s) return;
       const from = range && anchor.current ? rows.findIndex((e) => idOf(e) === anchor.current) : -1;
       const to = rows.findIndex((e) => idOf(e) === id);
-      if (from >= 0 && to >= 0) {
-        for (let i = Math.min(from, to); i <= Math.max(from, to); i++) next.add(idOf(rows[i]!));
-      } else if (next.has(id)) next.delete(id);
-      else next.add(id);
       anchor.current = id;
-      set(next);
+      if (to < 0) return;
+      change((n) => {
+        if (from >= 0) {
+          for (let k = Math.min(from, to); k <= Math.max(from, to); k++) pick(n, rows[k]!, offset + k);
+        } else if (selectedAt(id, offset + to)) {
+          n.picked.delete(id);
+          if (n.ranges.some(([a, b]) => offset + to >= a && offset + to < b)) n.excluded.set(id, offset + to);
+        } else pick(n, rows[to]!, offset + to);
+      });
     },
     end,
     selected,
     lazy,
     count,
+    async resolve(walk) {
+      if (!s) return [];
+      if (!lazy) return selected;
+      // In list order, as Android collects them: one walk of the view, filtered.
+      const all = await walk();
+      return all.filter((row, i) => selectedAt(idOf(row), i));
+    },
   };
-  const allSelected = active && selected.length === rows.length;
+  const n = Math.max(total, offset + rows.length);
+  const allSelected = active && count >= n;
   // The toolbar's action mode follows the selection; Escape ends it, as Android's back does.
   const live = useRef(sel);
   live.current = sel;
@@ -143,32 +213,70 @@ export function useSelection<T = EpisodeRow>(items: T[] | undefined, total: numb
   // Before the browser paints, so the title never shows an old count.
   useLayoutEffect(() => {
     if (!active) return;
+    // Indexes of what is selected: the first and the last (SelectableAdapter's select_all_above / _below).
+    const chosen: number[] = [];
+    for (const x of known) if (selectedAt(idOf(x.row), x.i)) chosen.push(x.i);
+    for (const [a, b] of s!.ranges) {
+      for (let i = a; i < Math.min(b, n); i++) {
+        const id = rows[i - offset] ? idOf(rows[i - offset]!) : null;
+        if (id === null || !s!.excluded.has(id)) {
+          chosen.push(i);
+          break;
+        }
+      }
+      for (let i = Math.min(b, n) - 1; i >= a; i--) {
+        const id = rows[i - offset] ? idOf(rows[i - offset]!) : null;
+        if (id === null || !s!.excluded.has(id)) {
+          chosen.push(i);
+          break;
+        }
+      }
+    }
     actionMode.set({
       count,
-      total: Math.max(total, rows.length),
+      total: n,
       allSelected,
       close: end,
       toggleAll() {
-        setLazy(!allSelected);
-        setIds(allSelected ? new Set() : new Set(rows.map(idOf)));
+        // Deselect all keeps the mode, with nothing selected; Select all takes every row of the list.
+        change((p) => {
+          p.picked.clear();
+          p.excluded.clear();
+          p.ranges = allSelected ? [] : [[0, n]];
+        }, false);
       },
       above() {
-        const first = rows.findIndex((e) => ids!.has(idOf(e)));
-        const next = new Set(ids);
-        for (let i = 0; i < first; i++) next.add(idOf(rows[i]!));
-        setIds(next);
+        const first = chosen.length ? Math.min(...chosen) : 0;
+        if (first > 0) change((p) => p.ranges.push([0, first]));
       },
       below() {
-        let last = -1;
-        rows.forEach((e, i) => ids!.has(idOf(e)) && (last = i));
-        const next = new Set(ids);
-        for (let i = last + 1; i < rows.length; i++) next.add(idOf(rows[i]!));
-        setLazy(true);
-        setIds(next);
+        const last = chosen.length ? Math.max(...chosen) : -1;
+        if (last + 1 < n) change((p) => p.ranges.push([last + 1, n]));
       },
     });
   });
   return sel;
+}
+
+/**
+ * useListSelection is a list's selection as a list window holds it: by the
+ * window's place in the list; the list holds still while selecting (set
+ * before anything else can apply); a view that expires ends the selection.
+ */
+export function useListSelection<T = EpisodeRow>(
+  items: T[] | undefined,
+  total: number,
+  win?: { offset: number; hold: (on: boolean) => void; lost: number },
+  idOf?: (x: T) => string,
+): Selection<T> {
+  const selection = useSelection(items, total, idOf, win?.offset ?? 0);
+  const hold = useRef(win?.hold);
+  hold.current = win?.hold;
+  useLayoutEffect(() => hold.current?.(selection.active), [selection.active]);
+  useEffect(() => {
+    if (win?.lost) selection.end();
+  }, [win?.lost]);
+  return selection;
 }
 
 /** A bulk action of the floating menu (Android's episodes_apply_action_speeddial, nav_feed_action_speeddial). */
@@ -229,23 +337,20 @@ export function bulkActions(sync: Sync, sel: EpisodeRow[], queue?: QueueContext)
  * marking 25 or more, or a selection with rows not loaded yet, asks first;
  * the rows not loaded yet are read before the action runs; then the mode ends.
  */
-export function SelectActions<T = EpisodeRow>({ sync, selection, actions, items, all, idOf = (x) => (x as EpisodeRow).episode_id }: {
+export function SelectActions<T = EpisodeRow>({ sync, selection, actions, all }: {
   sync: Sync;
   selection: Selection<T>;
   actions: BulkAction<T>[];
-  /** items are the rows loaded; `all` reads every row of the list. */
-  items: T[];
+  /** all reads every row of the list (the view the selection was made on), in list order. */
   all: () => Promise<T[]>;
+  /** Kept for callers: the rows loaded and their identity (the selection knows both). */
+  items?: T[];
   idOf?: (x: T) => string;
 }) {
   const [asking, setAsking] = useState<BulkAction<T> | null>(null);
   const perform = async (a: BulkAction<T>) => {
-    let targets = selection.selected;
-    if (selection.lazy) {
-      // Select all and Select all below take the rows not loaded yet, as Android loads its next pages.
-      const loaded = new Set(items.map(idOf));
-      targets = [...targets, ...(await all()).filter((e) => !loaded.has(idOf(e)))];
-    }
+    // The rows selected in list order; rows not loaded are read from the view the selection was made on.
+    const targets = await selection.resolve(all);
     await a.run(targets);
     selection.end();
   };
@@ -278,7 +383,8 @@ export function SelectActions<T = EpisodeRow>({ sync, selection, actions, items,
           onConfirm={async () => {
             const a = asking;
             setAsking(null);
-            await perform(a);
+            // The dialog is gone: a failure (a list that expired while it was read) is the snackbar's to say.
+            await track(perform(a));
           }}
         />
       )}

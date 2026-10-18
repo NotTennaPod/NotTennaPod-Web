@@ -6,6 +6,7 @@ import { acknowledge, append, installation, newAuthor, outcomeKeepMs, outcomeSho
 import { retainedEntries, takeSuccessor } from "../src/journal/successor.ts";
 import { recover, recoveryProblems, recoveryState, type RecoveryResult, type RecoveryTransport } from "../src/journal/recovery.ts";
 import { defaultBounds } from "../src/journal/pusher.ts";
+import { ApiError } from "../src/api/http.ts";
 
 let n = 0;
 const device = { name: "Browser", app_version: "1", capabilities: [] };
@@ -30,7 +31,7 @@ async function restored(texts: string[], opts: { secrets?: boolean } = {}) {
   }
   await acknowledge(db, account, receipts, { log_id: "old", epoch: 1 });
   const pending = await append(db, account, a.author_id, note("written after the backup, never acknowledged"));
-  await takeSuccessor(db, account, async () => {}, { freshNonce: false, device, recovery: true });
+  await takeSuccessor(db, account, async () => {}, { from: (await installation(db, account)).install_id, freshNonce: false, device, recovery: true });
   return { db, account, ops, pending };
 }
 
@@ -333,7 +334,7 @@ test("a profile with nothing acknowledged before the restore sends no recovery r
   const account = crypto.randomUUID();
   await installation(db, account);
   await updateInstallation(db, account, (r) => (r.registered = true));
-  await takeSuccessor(db, account, async () => {}, { freshNonce: false, device, recovery: true });
+  await takeSuccessor(db, account, async () => {}, { from: (await installation(db, account)).install_id, freshNonce: false, device, recovery: true });
   const { api, calls } = fake(() => "need", () => ({}));
   const out = await recover(db, account, api);
   assert.deepEqual(calls, []);
@@ -352,7 +353,7 @@ test("a recovery waits while its successor handoff is under way, then runs once 
   const e = await append(db, account, a.author_id, note("acknowledged before the restore"));
   await acknowledge(db, account, [{ install_seq: e.install_seq, receipt: { op_id: e.op_id, content_hash: "h", outcome: "applied", normalized_time: 1, epoch: 1, seq: 9, index: 0, key_id: "k", mac: "m" } }], { log_id: "old", epoch: 1 });
   // The successor is planned, but its registration does not reach the server.
-  await assert.rejects(takeSuccessor(db, account, async () => { throw new Error("offline"); }, { freshNonce: false, device, recovery: true }));
+  await assert.rejects(takeSuccessor(db, account, async () => { throw new Error("offline"); }, { from: (await installation(db, account)).install_id, freshNonce: false, device, recovery: true }));
   // The plan and the recovery were recorded together: no tab ever sees the recovery without its handoff.
   const planned = await installation(db, account);
   assert.ok(planned.successor && planned.recovery && !planned.recovery.finished);
@@ -361,7 +362,7 @@ test("a recovery waits while its successor handoff is under way, then runs once 
   assert.deepEqual(early.calls, []);
   assert.equal((await installation(db, account)).recovery!.finished, false);
   // The handoff is finished later (another load, the same plan); the recovery then sends the entry.
-  await takeSuccessor(db, account, async () => {}, { freshNonce: false, device });
+  await takeSuccessor(db, account, async () => {}, { from: (await installation(db, account)).install_id, freshNonce: false, device });
   const later = fake(() => "need", () => ({}));
   const out = await recover(db, account, later.api);
   assert.equal(out!.done, true);
@@ -382,7 +383,7 @@ test("a recovered refusal its tab has not shown stays out of the recovery until 
       const receipt = (op: string, seq: number): Receipt =>
         ({ op_id: op, content_hash: "h", outcome: "not_applied", reason: "generation_closed", normalized_time: 1, epoch: 1, seq, index: 0, key_id: "k", mac: "m" });
       await acknowledge(db, account, [{ install_seq: refused.install_seq, receipt: receipt(refused.op_id, 1) }, { install_seq: other.install_seq, receipt: receipt(other.op_id, 2) }], { log_id: "old", epoch: 1 });
-      await takeSuccessor(db, account, async () => {}, { freshNonce: false, device, recovery: true });
+      await takeSuccessor(db, account, async () => {}, { from: (await installation(db, account)).install_id, freshNonce: false, device, recovery: true });
       const { api, calls } = fake(() => result, () => ({}));
       const out = await recover(db, account, api);
       assert.deepEqual(out, { done: true, recovered: 2, pending: 0, problems: 0 }, `${result}: the recovery finishes`);
@@ -400,3 +401,122 @@ test("a recovered refusal its tab has not shown stays out of the recovery until 
     }
   }
 });
+
+test("a recovery the server no longer has open is opened again, once per attempt, and completes", async () => {
+  const { db, account, ops } = await restored(["a", "b"]);
+  const { api, calls } = fake(() => "need", () => ({}));
+  // The server loses the session after it was opened (another device's staged
+  // rebuild published without it): it answers as the server does until the
+  // recovery is opened again.
+  let open = false;
+  let lost = false;
+  const snapshot = api.snapshot, inventory = api.inventory, upload = api.upload, finish = api.finish;
+  const notOpen = () => new ApiError(400, "invalid_request", "This recovery is not open: start it with a recovery snapshot.");
+  api.snapshot = async (body) => {
+    open = true;
+    return snapshot(body);
+  };
+  api.inventory = async (body) => {
+    if (!lost) {
+      lost = true;
+      open = false;
+    }
+    if (!open) {
+      calls.push({ path: "inventory refused", body });
+      throw notOpen();
+    }
+    return inventory(body);
+  };
+  api.upload = async (body) => {
+    if (!open) throw notOpen();
+    return upload(body);
+  };
+  api.finish = async (body) => {
+    if (!open) throw notOpen();
+    return finish(body);
+  };
+  const out = await recover(db, account, api);
+  assert.deepEqual(calls.map((x) => x.path), ["snapshot", "inventory refused", "snapshot", "inventory", "upload", "finish"]);
+  assert.equal(out?.done, true);
+  assert.equal(out?.recovered, ops.length);
+  assert.equal((await installation(db, account)).recovery?.finished, true);
+  // Another refusal in the same attempt is the caller's to retry: one reopen per attempt.
+  const again = await restored(["c"]);
+  const twice = fake(() => "need", () => ({}));
+  twice.api.inventory = async () => {
+    throw notOpen();
+  };
+  await assert.rejects(recover(again.db, again.account, twice.api), ApiError);
+  assert.deepEqual(twice.calls.map((x) => x.path), ["snapshot", "snapshot"]);
+});
+
+/**
+ * inFlight sets up a profile whose push of one change was accepted by the
+ * server but whose answer is still on its way, when the server is restored and
+ * another tab takes the successor: that change's original receipt arrives late.
+ */
+async function inFlight() {
+  const db = await openDB(indexedDB, `recovery-${++n}`);
+  const account = crypto.randomUUID();
+  const first = await installation(db, account);
+  await updateInstallation(db, account, (r) => (r.registered = true));
+  const a = await newAuthor(db, account);
+  const sent = await append(db, account, a.author_id, note("pushed before the restore, its answer delayed"));
+  const receipt: Receipt = { op_id: sent.op_id, content_hash: "h-late", outcome: "applied", normalized_time: 1, epoch: 1, seq: 7, index: 0, key_id: "k", mac: "m-late" };
+  await takeSuccessor(db, account, async () => {}, { from: first.install_id, freshNonce: false, device, recovery: true });
+  const late = () => acknowledge(db, account, [{ install_seq: sent.install_seq, receipt }], { log_id: "old", epoch: 1 }, first.install_id);
+  return { db, account, sent, receipt, late };
+}
+
+test("an original receipt that arrives after the recovery finished is still recovered, with its own identity", async () => {
+  const { db, account, sent, receipt, late } = await inFlight();
+  const before = fake(() => "need", () => ({}));
+  assert.equal((await recover(db, account, before.api))?.done, true, "the other tab's recovery had nothing to send");
+  const finishedId = (await installation(db, account)).recovery!.recovery_id;
+  await late(); // the delayed answer arrives
+  const { api, calls } = fake(() => "need", () => ({}));
+  const out = await recover(db, account, api);
+  assert.equal(out?.done, true);
+  assert.deepEqual(calls.map((x) => x.path), ["snapshot", "inventory", "upload", "finish"]);
+  assert.notEqual(calls[0]!.body.recovery_id, finishedId, "a new recovery, without a new successor");
+  assert.deepEqual(calls[1]!.body.entries, [{ kind: "fact", op_id: sent.op_id, content_hash: "h-late", position: [1, 7, 0] }]);
+  const uploaded = (calls[2]!.body.entries as { fact: { op_id: string }; receipt: Receipt }[])[0]!;
+  assert.equal(uploaded.fact.op_id, sent.op_id);
+  assert.deepEqual(uploaded.receipt, receipt, "the original receipt, as the server signed it");
+  assert.equal((await installation(db, account)).predecessors.length, 1, "no successor was taken for it");
+  assert.equal((await retainedEntries(db, account)).length, 0);
+  assert.equal(await recover(db, account, fake(() => "need", () => ({})).api), null, "nothing more is owed");
+});
+
+test("an original receipt that arrives while a recovery is finishing is recovered by the next attempt", async () => {
+  const { db, account, sent, late } = await restoredWithLate();
+  // The attempt has read what to send and is finishing when the delayed answer arrives.
+  const { api } = fake(() => "have", () => ({}));
+  const finishing = api.finish;
+  api.finish = async (body) => {
+    await late();
+    return finishing(body);
+  };
+  assert.equal((await recover(db, account, api))?.done, false, "the attempt does not answer for evidence it never read");
+  const next = fake(() => "need", () => ({}));
+  assert.equal((await recover(db, account, next.api))?.done, true);
+  assert.deepEqual((next.calls[1]!.body.entries as { op_id: string }[]).map((e) => e.op_id), [sent.op_id]);
+  assert.ok(next.calls.some((x) => x.path === "upload"));
+  assert.equal((await retainedEntries(db, account)).length, 0);
+});
+
+/** restoredWithLate is inFlight with another acknowledged change the recovery has to send first. */
+async function restoredWithLate() {
+  const db = await openDB(indexedDB, `recovery-${++n}`);
+  const account = crypto.randomUUID();
+  const first = await installation(db, account);
+  await updateInstallation(db, account, (r) => (r.registered = true));
+  const a = await newAuthor(db, account);
+  const acked = await append(db, account, a.author_id, note("acknowledged before the restore"));
+  await acknowledge(db, account, [{ install_seq: acked.install_seq, receipt: { op_id: acked.op_id, content_hash: "h0", outcome: "applied", normalized_time: 1, epoch: 1, seq: 5, index: 0, key_id: "k", mac: "m" } }], { log_id: "old", epoch: 1 });
+  const sent = await append(db, account, a.author_id, note("pushed before the restore, its answer delayed"));
+  await takeSuccessor(db, account, async () => {}, { from: first.install_id, freshNonce: false, device, recovery: true });
+  const receipt: Receipt = { op_id: sent.op_id, content_hash: "h-late", outcome: "applied", normalized_time: 1, epoch: 1, seq: 7, index: 0, key_id: "k", mac: "m-late" };
+  const late = () => acknowledge(db, account, [{ install_seq: sent.install_seq, receipt }], { log_id: "old", epoch: 1 }, first.install_id);
+  return { db, account, sent, late };
+}

@@ -4,7 +4,7 @@
 // the work still under way.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { AudioMedia, type Descriptor, type MediaStatus, type Sources } from "../src/player/media.ts";
+import { AudioMedia, directFailureMax, directFailureMs, directFailures, type Descriptor, type DirectFailures, type MediaStatus, type Sources } from "../src/player/media.ts";
 import { FakeMediaSource, install, settled as flush, sourceAt, Stream } from "./fakeMediaSource.ts";
 
 /** FakeAudio is an <audio> element as far as AudioMedia uses it, with the browser's play-promise rules. */
@@ -126,16 +126,16 @@ function deferred<T>() {
 /** settled lets every pending promise continuation and event of the adapter run (the fakes answer in microtasks). */
 const settled = () => new Promise((r) => setImmediate(r));
 
-function media(sources: Partial<Sources>) {
-  const calls = { ended: 0, error: 0, paused: 0 };
+function media(sources: Partial<Sources>, opts: { failures?: DirectFailures } = {}) {
+  const calls = { ended: 0, error: 0, paused: 0, waiting: [] as boolean[] };
   const m = new AudioMedia(1, {
     capabilities: async () => [],
     describe: async () => descriptor(),
     status: async () => ({ state: "complete", error: null }),
     wording: (e) => e.message,
     ...sources,
-  });
-  m.listen({ paused: () => calls.paused++, ended: () => calls.ended++, time() {}, error: () => calls.error++ });
+  }, opts);
+  m.listen({ paused: () => calls.paused++, ended: () => calls.ended++, time() {}, error: () => calls.error++, waiting: (on) => calls.waiting.push(on) });
   return { m, calls, el: element };
 }
 
@@ -613,5 +613,787 @@ test("ManagedMediaSource turns remote playback off only while a converted stream
     m.unload();
   } finally {
     undo();
+  }
+});
+
+// ---- starting an episode: the media types ahead of time; publisher URLs that failed in this browser
+
+test("the media types are asked once, before the first play: a play asks no more", async () => {
+  const asked = { capabilities: 0, profiles: 0 };
+  const { m } = media({
+    capabilities: async () => (asked.capabilities++, ["audio/mpeg"]),
+    profiles: async () => (asked.profiles++, []),
+  });
+  m.prepare();
+  await settled();
+  assert.deepEqual(asked, { capabilities: 1, profiles: 1 });
+  await m.load("episode:a", 0);
+  await m.load("episode:b", 0);
+  assert.deepEqual(asked, { capabilities: 1, profiles: 1 });
+});
+
+/** MemoryStorage is the browser's localStorage, as directFailures uses it. */
+class MemoryStorage {
+  items = new Map<string, string>();
+  getItem(k: string) {
+    return this.items.get(k) ?? null;
+  }
+  setItem(k: string, v: string) {
+    this.items.set(k, v);
+  }
+}
+
+/** publisher answers direct with the publisher's URL, and the relay once asked with direct_failed; it records each request's flag. */
+function publisherDescriptors() {
+  const flags: boolean[] = [];
+  const describe = async (id: string, body: Record<string, unknown>) => {
+    flags.push(body.direct_failed === true);
+    return body.direct_failed
+      ? descriptor({ mode: "relay", url: `/v1/media/s/${id}` })
+      : descriptor({ mode: "direct", url: `https://publisher.test/${id}.mp3`, token: null });
+  };
+  return { flags, describe };
+}
+
+/** failSource makes the element fail the source it is loading, as a browser does for a URL it cannot fetch or play. */
+function failSource(el: { error: { code: number } | null; dispatchEvent(e: Event): boolean }) {
+  el.error = { code: 4 };
+  el.dispatchEvent(new Event("error"));
+}
+
+test("a publisher URL that failed in this browser is remembered: the episode's next descriptors ask for the relay at once, also after a reload, for a day", async () => {
+  const store = new MemoryStorage();
+  let now = 1_800_000_000_000;
+  const d = publisherDescriptors();
+  const first = media({ describe: d.describe }, { failures: directFailures(store, "account-1", () => now) });
+  first.el.holdMetadata = true;
+  const loading = first.m.load("episode:a", 0);
+  await settled();
+  assert.equal(first.el.src, "https://publisher.test/a.mp3");
+  failSource(first.el);
+  await settled();
+  assert.equal(first.el.src, "/v1/media/s/a", "the relay after the failure");
+  first.el.error = null;
+  first.el.meta();
+  await loading;
+  assert.deepEqual(d.flags, [false, true]);
+
+  // A new page (a reload, the server perhaps restarted and forgot): the relay at once, never the publisher's URL.
+  d.flags.length = 0;
+  const second = media({ describe: d.describe }, { failures: directFailures(store, "account-1", () => now) });
+  await second.m.load("episode:a", 0);
+  assert.equal(second.el.src, "/v1/media/s/a");
+  assert.deepEqual(d.flags, [true]);
+  // Another episode, and the same episode in another account, still try the publisher's URL.
+  await second.m.load("episode:b", 0);
+  const other = media({ describe: d.describe }, { failures: directFailures(store, "account-2", () => now) });
+  await other.m.load("episode:a", 0);
+  assert.deepEqual(d.flags, [true, false, false]);
+  // A day after the failure the publisher's URL is tried again.
+  now += directFailureMs;
+  const later = media({ describe: d.describe }, { failures: directFailures(store, "account-1", () => now) });
+  await later.m.load("episode:a", 0);
+  assert.equal(later.el.src, "https://publisher.test/a.mp3");
+});
+
+test("a publisher URL that fails while it plays is remembered too", async () => {
+  const store = new MemoryStorage();
+  const d = publisherDescriptors();
+  const first = media({ describe: d.describe }, { failures: directFailures(store, "account-1") });
+  await first.m.load("episode:a", 0);
+  await first.m.play();
+  assert.equal(first.el.src, "https://publisher.test/a.mp3");
+  first.el.currentTime = 30;
+  failSource(first.el); // the publisher's connection broke
+  await settled();
+  await settled();
+  assert.equal(first.el.src.startsWith("https://publisher.test/"), false, "it plays on from the server");
+  assert.deepEqual(d.flags.slice(0, 2), [false, true]);
+  d.flags.length = 0;
+  const second = media({ describe: d.describe }, { failures: directFailures(store, "account-1") });
+  await second.m.load("episode:a", 0);
+  assert.deepEqual(d.flags, [true], "a new page asks for the relay at once");
+});
+
+test("the failures kept are the newest, a bounded number; without storage the page still remembers", async () => {
+  const store = new MemoryStorage();
+  let now = 1_800_000_000_000;
+  const f = directFailures(store, "account-1", () => now);
+  for (let i = 0; i <= directFailureMax; i++) {
+    now++;
+    f.add(`e${i}`);
+  }
+  const kept = JSON.parse(store.getItem("nottennapod:account-1:direct_failed")!) as Record<string, number>;
+  assert.equal(Object.keys(kept).length, directFailureMax);
+  const fresh = directFailures(store, "account-1", () => now);
+  assert.equal(fresh.has("e0"), false, "the oldest went first");
+  assert.equal(fresh.has("e1"), true);
+  assert.equal(fresh.has(`e${directFailureMax}`), true);
+  const refusing = { getItem: () => null, setItem: () => { throw new Error("quota"); } };
+  const page = directFailures(refusing, "account-1", () => now);
+  page.add("x");
+  assert.equal(page.has("x"), true);
+  assert.equal(directFailures(null, "account-1").has("x"), false);
+});
+
+/**
+ * connection is this device's network as the player sees it: the browser's
+ * online flag and event, and whether the app's own server answers; guard
+ * makes a server call fail while it does not.
+ */
+function connection() {
+  const events = new EventTarget();
+  const net = { browser: true, server: true };
+  const saved = Object.getOwnPropertyDescriptor(globalThis, "navigator")!;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, get: () => ({ onLine: net.browser }) });
+  g.addEventListener = events.addEventListener.bind(events);
+  g.removeEventListener = events.removeEventListener.bind(events);
+  const up = () => net.browser && net.server;
+  return {
+    net,
+    reachable: async () => up(),
+    guard<A extends unknown[], R>(fn: (...a: A) => Promise<R>) {
+      return async (...a: A): Promise<R> => {
+        if (!up()) throw new Error("unreachable");
+        return fn(...a);
+      };
+    },
+    /** back is the connection coming back: the browser says so. */
+    back() {
+      net.browser = net.server = true;
+      events.dispatchEvent(new Event("online"));
+    },
+    /** online is the browser saying it is online, whatever the server answers. */
+    online() {
+      events.dispatchEvent(new Event("online"));
+    },
+    /** held answers each server check only when the test resolves it, in order. */
+    held() {
+      const checks: ((up: boolean) => void)[] = [];
+      const reachable = () => {
+        const d = deferred<boolean>();
+        checks.push(d.resolve);
+        return d.promise;
+      };
+      return { checks, reachable };
+    },
+    restore() {
+      Object.defineProperty(globalThis, "navigator", saved);
+      delete g.addEventListener;
+      delete g.removeEventListener;
+    },
+  };
+}
+
+/** A file fetched in ranges: the element seeks anywhere in it. */
+const whole = { length: 1, start: () => 0, end: () => 600 };
+
+/** networkError is the element's transfer breaking (MEDIA_ERR_NETWORK). */
+function networkError(el: { error: { code: number } | null; dispatchEvent(e: Event): boolean }) {
+  el.error = { code: 2 };
+  el.dispatchEvent(new Event("error"));
+}
+
+const settle = async (n = 4) => {
+  for (let i = 0; i < n; i++) await settled();
+};
+
+test("a network error while this device is offline waits for the connection, blames no publisher, and plays on at its position once connected", async () => {
+  const c = connection();
+  try {
+    const store = new MemoryStorage();
+    const failures = directFailures(store, "account-1");
+    const d = publisherDescriptors();
+    const { m, calls, el } = media({ describe: c.guard(d.describe), reachable: c.reachable }, { failures });
+    el.seekable = whole;
+    await m.load("episode:a", 0);
+    await m.play();
+    el.currentTime = 30;
+    c.net.server = false; // the laptop's connection dropped: the browser has not noticed, but the app's server does not answer either
+    networkError(el);
+    await settle();
+    assert.equal(failures.has("a"), false, "the publisher is not blamed for this device's connection");
+    assert.equal(store.getItem("nottennapod:account-1:direct_failed"), null);
+    assert.deepEqual(d.flags, [false], "nothing is asked while offline");
+    assert.deepEqual(calls.waiting, [true], "the player shows the wait");
+    assert.equal(calls.error, 0, "no connection error");
+    assert.equal(m.position, 30_000);
+
+    c.back();
+    await settle();
+    assert.deepEqual(d.flags, [false, false], "a new descriptor: the publisher's URL again");
+    assert.equal(el.src, "https://publisher.test/a.mp3");
+    assert.equal(el.currentTime, 30, "at the position it had");
+    assert.equal(el.paused, false, "and it plays");
+    assert.deepEqual(calls.waiting, [true, false]);
+    assert.deepEqual([calls.ended, calls.error], [0, 0]);
+    assert.equal(failures.has("a"), false);
+  } finally {
+    c.restore();
+  }
+});
+
+test("two drops of the connection in one episode are both ridden out, with no connection error", async () => {
+  const c = connection();
+  try {
+    const described: number[] = [];
+    const { m, calls, el } = media({
+      describe: c.guard(async (_id: string, body: Record<string, unknown>) => (described.push(body.start_ms as number), descriptor())),
+      status: c.guard(async () => ({ state: "streaming", error: null }) as MediaStatus),
+      reachable: c.reachable,
+    });
+    el.seekable = whole;
+    await m.load("episode:a", 0);
+    await m.play();
+    // The first drop breaks the relayed stream; the browser knows it is offline.
+    el.currentTime = 40;
+    c.net.browser = false;
+    networkError(el);
+    await settle();
+    assert.deepEqual(calls.waiting, [true]);
+    c.back();
+    await settle();
+    assert.deepEqual(described, [0, 40_000]);
+    assert.equal(el.paused, false);
+    assert.equal(m.position, 40_000);
+    el.error = null; // the reload's new source has none
+
+    // The second drop ends the stream early, and the server cannot be asked why.
+    el.currentTime = 95;
+    c.net.browser = false;
+    el.end();
+    await settle();
+    assert.deepEqual(calls.waiting, [true, false, true]);
+    assert.equal(m.position, 95_000);
+    c.back();
+    await settle();
+    assert.deepEqual(described, [0, 40_000, 95_000]);
+    assert.equal(el.paused, false);
+    assert.equal(el.currentTime, 95);
+    assert.deepEqual(calls.waiting, [true, false, true, false]);
+    assert.deepEqual([calls.ended, calls.error], [0, 0], "no connection error, and no end");
+  } finally {
+    c.restore();
+  }
+});
+
+test("a publisher that fails while the app's server answers is remembered as direct-failed, and the relay plays on", async () => {
+  const c = connection();
+  try {
+    const failures = directFailures(new MemoryStorage(), "account-1");
+    const d = publisherDescriptors();
+    const { m, calls, el } = media({ describe: c.guard(d.describe), reachable: c.reachable }, { failures });
+    el.seekable = whole;
+    await m.load("episode:a", 0);
+    await m.play();
+    el.currentTime = 30;
+    networkError(el); // the publisher's transfer broke; this device is connected
+    await settle();
+    assert.equal(failures.has("a"), true);
+    assert.deepEqual(d.flags, [false, true]);
+    assert.equal(el.src, "/v1/media/s/a");
+    assert.equal(el.currentTime, 30);
+    assert.equal(el.paused, false);
+    assert.deepEqual(calls.waiting, [], "no wait for a connection that is there");
+    assert.equal(calls.error, 0);
+  } finally {
+    c.restore();
+  }
+});
+
+test("Pause while waiting for the connection: nothing reloads when it comes back; Play then plays on there", async () => {
+  const c = connection();
+  try {
+    const d = publisherDescriptors();
+    const { m, calls, el } = media({ describe: c.guard(d.describe), reachable: c.reachable });
+    el.seekable = whole;
+    await m.load("episode:a", 0);
+    await m.play();
+    el.currentTime = 30;
+    c.net.server = false;
+    networkError(el);
+    await settle();
+    m.pause();
+    await settle();
+    assert.deepEqual(calls.waiting, [true, false], "the wait ends with Pause");
+    c.back();
+    await settle();
+    assert.deepEqual(d.flags, [false], "no reload");
+    assert.equal(el.paused, true);
+    assert.equal(m.position, 30_000);
+    assert.equal(calls.error, 0);
+
+    await m.play();
+    await settle();
+    assert.deepEqual(d.flags, [false, false]);
+    assert.equal(el.currentTime, 30);
+    assert.equal(el.paused, false);
+    assert.deepEqual(calls.waiting, [true, false, true, false]);
+    assert.equal(calls.error, 0);
+  } finally {
+    c.restore();
+  }
+});
+
+test("Pause, or another episode, while a connection check is pending: its late answer changes nothing", async () => {
+  const c = connection();
+  try {
+    // Pause while the check is out: no reload when it answers, and it stays paused.
+    let h = c.held();
+    const d = publisherDescriptors();
+    const one = media({ describe: d.describe, reachable: h.reachable });
+    one.el.seekable = whole;
+    await one.m.load("episode:a", 0);
+    await one.m.play();
+    one.el.currentTime = 30;
+    networkError(one.el);
+    await settle();
+    h.checks[0]!(false); // offline: it waits
+    await settle();
+    c.online(); // the browser says online: a check goes out, and is not answered yet
+    await settle();
+    assert.equal(h.checks.length, 2);
+    one.m.pause();
+    h.checks[1]!(true);
+    await settle();
+    assert.deepEqual(d.flags, [false], "no reload after Pause");
+    assert.equal(one.el.paused, true);
+    assert.equal(one.m.position, 30_000);
+    assert.deepEqual(one.calls.waiting, [true, false]);
+    assert.equal(one.calls.error, 0);
+
+    // Pause, then another episode, while the check is out: the old answer never moves the new episode.
+    h = c.held();
+    const described: string[] = [];
+    const two = media({
+      describe: async (id, body) => (described.push(`${id}@${body.start_ms as number}`), descriptor({ mode: "direct", url: `https://publisher.test/${id}.mp3`, token: null })),
+      reachable: h.reachable,
+    });
+    two.el.seekable = whole;
+    await two.m.load("episode:a", 0);
+    await two.m.play();
+    two.el.currentTime = 30;
+    networkError(two.el);
+    await settle();
+    h.checks[0]!(false);
+    await settle();
+    c.online();
+    await settle();
+    two.m.pause();
+    two.el.error = null;
+    await two.m.load("episode:b", 90_000);
+    await two.m.play();
+    h.checks[1]!(true);
+    await settle();
+    assert.deepEqual(described, ["a@0", "b@90000"], "nothing asked at a's position");
+    assert.equal(two.el.src, "https://publisher.test/b.mp3");
+    assert.equal(two.m.position, 90_000);
+    assert.equal(two.el.paused, false);
+    assert.deepEqual(two.calls.waiting, [true, false], "the old wait ended with the new episode, and never again");
+    assert.equal(two.calls.error, 0);
+  } finally {
+    c.restore();
+  }
+});
+
+test("a second drop during the reconnect waits again, then plays on", async () => {
+  const c = connection();
+  try {
+    const d = publisherDescriptors();
+    let dropOnce = false;
+    const describe = c.guard(async (id: string, body: Record<string, unknown>) => {
+      if (dropOnce) {
+        dropOnce = false;
+        c.net.server = false; // the connection drops again while the episode is asked for
+        throw new Error("unreachable");
+      }
+      return d.describe(id, body);
+    });
+    const { m, calls, el } = media({ describe, reachable: c.reachable });
+    el.seekable = whole;
+    await m.load("episode:a", 0);
+    await m.play();
+    el.currentTime = 30;
+    c.net.server = false;
+    networkError(el);
+    await settle();
+    dropOnce = true;
+    c.back();
+    await settle();
+    assert.deepEqual(calls.waiting, [true], "still waiting");
+    assert.equal(calls.error, 0, "no connection error");
+    assert.equal(m.position, 30_000);
+    assert.equal(m.lastError, null);
+    c.back();
+    await settle();
+    assert.deepEqual(d.flags, [false, false]);
+    assert.equal(el.src, "https://publisher.test/a.mp3");
+    assert.equal(el.currentTime, 30);
+    assert.equal(el.paused, false);
+    assert.deepEqual(calls.waiting, [true, false]);
+    assert.equal(calls.error, 0);
+  } finally {
+    c.restore();
+  }
+});
+
+test("a seek while the first connection check is pending keeps the recovery, which plays on at the seek's target", async () => {
+  const c = connection();
+  try {
+    const h = c.held();
+    const d = publisherDescriptors();
+    const { m, calls, el } = media({ describe: d.describe, reachable: h.reachable });
+    el.seekable = whole;
+    await m.load("episode:a", 0);
+    await m.play();
+    el.currentTime = 30;
+    networkError(el);
+    await settle();
+    m.seek(90_000);
+    h.checks[0]!(false);
+    await settle();
+    assert.deepEqual(calls.waiting, [true], "it waits for the connection");
+    assert.equal(m.position, 90_000);
+    c.online();
+    await settle();
+    h.checks[1]!(true);
+    await settle();
+    assert.deepEqual(d.flags, [false, false]);
+    assert.equal(el.currentTime, 90);
+    assert.equal(el.paused, false);
+    assert.deepEqual(calls.waiting, [true, false]);
+    assert.equal(calls.error, 0);
+  } finally {
+    c.restore();
+  }
+});
+
+test("a drop while an episode loads blames no publisher: Play plays on once connected", async () => {
+  const c = connection();
+  try {
+    const failures = directFailures(new MemoryStorage(), "account-1");
+    const d = publisherDescriptors();
+    const { m, calls, el } = media({ describe: c.guard(d.describe), reachable: c.reachable }, { failures });
+    el.seekable = whole;
+    el.holdMetadata = true;
+    const loading = m.load("episode:a", 45_000);
+    await settled();
+    assert.equal(el.src, "https://publisher.test/a.mp3");
+    c.net.server = false;
+    networkError(el); // the connection dropped before the metadata came
+    await loading;
+    assert.equal(failures.has("a"), false, "the publisher is not blamed");
+    assert.deepEqual(d.flags, [false]);
+    assert.equal(m.position, 45_000);
+    el.error = null;
+    el.holdMetadata = false;
+    await m.play();
+    await settle();
+    assert.deepEqual(calls.waiting, [true], "Play waits for the connection");
+    c.back();
+    await settle();
+    assert.deepEqual(d.flags, [false, false]);
+    assert.equal(el.currentTime, 45);
+    assert.equal(el.paused, false);
+    assert.deepEqual(calls.waiting, [true, false]);
+    assert.equal(calls.error, 0);
+    assert.equal(failures.has("a"), false);
+  } finally {
+    c.restore();
+  }
+});
+
+/** asked answers each descriptor request after the first only when the test settles it, in order; it counts the element's loads. */
+function askedLater(el: { load(): void }) {
+  const flags: boolean[] = [];
+  const pending: { body: Record<string, unknown>; resolve: (d: Descriptor) => void; reject: (e: Error) => void }[] = [];
+  const describe = (id: string, body: Record<string, unknown>) => {
+    flags.push(body.direct_failed === true);
+    if (flags.length === 1) return Promise.resolve(descriptor({ mode: "direct", url: `https://publisher.test/${id}.mp3`, token: null }));
+    return new Promise<Descriptor>((resolve, reject) => pending.push({ body, resolve, reject }));
+  };
+  const loads = { n: 0 };
+  return {
+    flags,
+    pending,
+    describe,
+    loads,
+    /** counting makes the element count its loads (a fresh source is a load). */
+    counting() {
+      const load = el.load.bind(el);
+      el.load = () => {
+        loads.n++;
+        load();
+      };
+    },
+  };
+}
+
+const direct = (id: string) => descriptor({ mode: "direct", url: `https://publisher.test/${id}.mp3`, token: null });
+
+test("a seek while the reconnect's descriptor is pending: the fresh source is put in place and plays at the seek's target, also after another drop", async () => {
+  const c = connection();
+  try {
+    let a!: ReturnType<typeof askedLater>;
+    const { m, calls, el } = media({ describe: (id, body) => a.describe(id, body), reachable: c.reachable });
+    a = askedLater(el);
+    a.counting();
+    el.seekable = whole;
+    await m.load("episode:a", 0);
+    await m.play();
+    el.currentTime = 30;
+    c.net.server = false;
+    networkError(el);
+    await settle();
+    c.back();
+    await settle();
+    assert.equal(a.pending.length, 1, "the reconnect asks for the episode");
+    const loadsBefore = a.loads.n;
+    m.seek(90_000);
+    assert.equal(m.position, 90_000);
+    el.error = null; // the fresh source has none
+    a.pending[0]!.resolve(direct("a"));
+    await settle();
+    assert.ok(a.loads.n > loadsBefore, "a fresh source is put in place");
+    assert.equal(a.pending[1]?.body.start_ms, 90_000, "the recovery reloads at the seek's target");
+    a.pending[1]!.resolve(direct("a"));
+    await settle();
+    assert.equal(el.currentTime, 90);
+    assert.equal(el.paused, false);
+    assert.deepEqual(calls.waiting, [true, false]);
+    assert.equal(calls.error, 0);
+
+    // Again, and the connection drops while the descriptor is pending: it waits again, for the seek's target.
+    el.currentTime = 120;
+    c.net.server = false;
+    networkError(el);
+    await settle();
+    c.back();
+    await settle();
+    assert.equal(a.pending.length, 3);
+    m.seek(200_000);
+    c.net.server = false;
+    a.pending[2]!.reject(new Error("unreachable"));
+    await settle();
+    assert.deepEqual(calls.waiting, [true, false, true], "waiting again");
+    assert.equal(calls.error, 0);
+    assert.equal(m.position, 200_000);
+    const loadsDropped = a.loads.n;
+    el.error = null;
+    c.back();
+    await settle();
+    assert.equal(a.pending.length, 4);
+    assert.equal(a.pending[3]!.body.start_ms, 200_000);
+    a.pending[3]!.resolve(direct("a"));
+    await settle();
+    assert.ok(a.loads.n > loadsDropped, "a fresh source is put in place");
+    assert.equal(el.currentTime, 200);
+    assert.equal(el.paused, false);
+    assert.deepEqual(calls.waiting, [true, false, true, false]);
+    assert.equal(calls.error, 0);
+    assert.ok(a.flags.every((f) => !f), "nothing blamed on the publisher");
+  } finally {
+    c.restore();
+  }
+});
+
+test("Pause during the first connection check of a playing recovery: nothing is blamed or reloaded; Play plays on there", async () => {
+  const c = connection();
+  try {
+    const h = c.held();
+    const failures = directFailures(new MemoryStorage(), "account-1");
+    const d = publisherDescriptors();
+    const { m, calls, el } = media({ describe: d.describe, reachable: h.reachable }, { failures });
+    el.seekable = whole;
+    await m.load("episode:a", 0);
+    await m.play();
+    el.currentTime = 30;
+    networkError(el);
+    await settle();
+    m.pause();
+    h.checks[0]!(true); // connected, but the person paused first
+    await settle();
+    assert.deepEqual(d.flags, [false], "no reload while paused");
+    assert.equal(failures.has("a"), false, "nothing blamed");
+    assert.equal(el.paused, true);
+    assert.equal(m.position, 30_000);
+    assert.deepEqual([calls.error, calls.waiting.length], [0, 0]);
+
+    el.error = null;
+    await m.play();
+    await settle();
+    h.checks[1]!(true);
+    await settle();
+    assert.deepEqual(d.flags, [false, false], "a new descriptor, the publisher's URL again");
+    assert.equal(el.currentTime, 30);
+    assert.equal(el.paused, false);
+    assert.equal(calls.error, 0);
+    assert.equal(failures.has("a"), false);
+  } finally {
+    c.restore();
+  }
+});
+
+test("Pause during the check after a failed reconnect: no late error; Play plays on there", async () => {
+  const c = connection();
+  try {
+    const h = c.held();
+    let refuse = true;
+    const d = publisherDescriptors();
+    const describe = async (id: string, body: Record<string, unknown>) => {
+      if (d.flags.length === 1 && refuse) {
+        refuse = false;
+        d.flags.push(false);
+        throw new Error("the request failed");
+      }
+      return d.describe(id, body);
+    };
+    const { m, calls, el } = media({ describe, reachable: h.reachable });
+    el.seekable = whole;
+    await m.load("episode:a", 0);
+    await m.play();
+    el.currentTime = 30;
+    networkError(el);
+    await settle();
+    h.checks[0]!(false); // offline: it waits
+    await settle();
+    c.online();
+    await settle();
+    h.checks[1]!(true); // connected: the reconnect's request fails
+    await settle();
+    assert.equal(h.checks.length, 3, "the failure's cause is asked");
+    m.pause();
+    h.checks[2]!(true);
+    await settle();
+    assert.equal(calls.error, 0, "no late error after Pause");
+    assert.equal(el.paused, true);
+    assert.equal(m.position, 30_000);
+    assert.deepEqual(calls.waiting, [true, false]);
+
+    el.error = null;
+    await m.play();
+    await settle();
+    h.checks[3]!(true);
+    await settle();
+    assert.equal(el.currentTime, 30);
+    assert.equal(el.paused, false);
+    assert.equal(calls.error, 0);
+  } finally {
+    c.restore();
+  }
+});
+
+/**
+ * converted answers a's first descriptor at once and every later one of a
+ * only when the test settles it (each starts at its start_ms); b's at once.
+ * The element plays the stream itself (no MediaSource here).
+ */
+function converted() {
+  const asked: string[] = [];
+  const pending: { start: number; resolve: () => void; reject: (e: Error) => void }[] = [];
+  const compat = (id: string, start: number) => descriptor({ mode: "compat", url: `/v1/media/s/${id}-${start}`, offset_ms: start, seekable: true });
+  const describe = (id: string, body: Record<string, unknown>) => {
+    const start = body.start_ms as number;
+    asked.push(`${id}@${start}`);
+    if (id !== "a" || asked.length === 1) return Promise.resolve(compat(id, start));
+    return new Promise<Descriptor>((resolve, reject) => pending.push({ start, resolve: () => resolve(compat(id, start)), reject }));
+  };
+  return { asked, pending, describe };
+}
+
+/** reconnecting plays converted a, breaks it at 30 s while offline, comes back, and leaves the reconnect's descriptor pending. */
+async function reconnecting(c: ReturnType<typeof connection>, v: ReturnType<typeof converted>) {
+  const made = media({ describe: v.describe, reachable: c.reachable });
+  await made.m.load("episode:a", 0);
+  await made.m.play();
+  made.el.currentTime = 30;
+  c.net.server = false;
+  networkError(made.el);
+  await settle();
+  made.el.error = null;
+  c.back();
+  await settle();
+  assert.deepEqual(v.asked, ["a@0", "a@30000"]);
+  return made;
+}
+
+test("a converted stream: a seek while the reconnect's descriptor is pending, then a drop before the new stream's metadata, waits again and plays on at the seek's target", async () => {
+  const c = connection();
+  try {
+    const v = converted();
+    const { m, calls, el } = await reconnecting(c, v);
+    m.seek(90_000);
+    v.pending[0]!.resolve(); // the stream at 30 s is in place: the recovery asks again at the seek's target
+    await settle();
+    assert.deepEqual(v.asked, ["a@0", "a@30000", "a@90000"], "the recovery reloads at the seek's target");
+    el.holdMetadata = true;
+    v.pending[1]!.resolve();
+    await settle();
+    assert.equal(el.src, "/v1/media/s/a-90000");
+    c.net.server = false;
+    networkError(el); // the connection drops before the new stream's metadata
+    await settle();
+    assert.deepEqual(calls.waiting, [true], "it waits again");
+    assert.equal(calls.error, 0, "no connection error");
+    assert.equal(m.position, 90_000);
+    el.error = null;
+    el.holdMetadata = false;
+    c.back();
+    await settle();
+    assert.deepEqual(v.asked, ["a@0", "a@30000", "a@90000", "a@90000"]);
+    v.pending[2]!.resolve();
+    await settle();
+    assert.equal(el.src, "/v1/media/s/a-90000");
+    assert.equal(m.position, 90_000);
+    assert.equal(el.paused, false);
+    assert.deepEqual(calls.waiting, [true, false]);
+    assert.equal(calls.error, 0);
+  } finally {
+    c.restore();
+  }
+});
+
+test("a converted stream: Pause, or another episode, while the reload at a seek's target is pending", async () => {
+  const c = connection();
+  try {
+    // Pause: the stream at the target is put in place paused, with no error; Play plays it there.
+    let v = converted();
+    const one = await reconnecting(c, v);
+    one.m.seek(90_000);
+    v.pending[0]!.resolve();
+    await settle();
+    assert.equal(v.pending.length, 2, "the reload at the seek's target is pending");
+    one.m.pause();
+    v.pending[1]!.resolve();
+    await settle();
+    assert.equal(one.el.src, "/v1/media/s/a-90000");
+    assert.equal(one.el.paused, true);
+    assert.equal(one.m.position, 90_000);
+    assert.deepEqual(one.calls.waiting, [true, false]);
+    assert.equal(one.calls.error, 0);
+    await one.m.play();
+    await settle();
+    assert.equal(one.el.paused, false);
+    assert.equal(one.m.position, 90_000);
+    assert.equal(v.asked.length, 3, "nothing asked again");
+
+    // Another episode: the late descriptor of a never replaces it.
+    v = converted();
+    const two = await reconnecting(c, v);
+    two.m.seek(90_000);
+    v.pending[0]!.resolve();
+    await settle();
+    assert.equal(v.pending.length, 2);
+    await two.m.load("episode:b", 10_000);
+    await two.m.play();
+    v.pending[1]!.resolve();
+    await settle();
+    assert.equal(two.el.src, "/v1/media/s/b-10000");
+    assert.equal(two.m.position, 10_000);
+    assert.equal(two.el.paused, false);
+    assert.deepEqual(two.calls.waiting, [true, false]);
+    assert.equal(two.calls.error, 0);
+  } finally {
+    c.restore();
   }
 });

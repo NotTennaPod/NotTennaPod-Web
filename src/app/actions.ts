@@ -3,7 +3,9 @@
 // Episodes are named by EpisodeRef (episode, podcast, live generation and the
 // occurrence evidence of their identity record).
 import type { EpisodeRow, PodcastRow, Records } from "../api/views.ts";
-import type { FactBody } from "../journal/journal.ts";
+import type { Fact } from "../journal/db.ts";
+import { maxFactBytes, maxUnframedFactBytes, type FactBody } from "../journal/journal.ts";
+import { canonical, utf8 } from "../journal/jcs.ts";
 import { between, keyString, parseKey, uuidValue, type QueueKey } from "../queue/keys.ts";
 import { uuid } from "../util/random.ts";
 
@@ -80,6 +82,80 @@ export function dismiss(es: EpisodeRow[], all = false): FactBody {
     payload: { episodes: rs },
     dependencies: es.flatMap((e) => provenance(e.records)),
   };
+}
+
+/**
+ * chunkBytes bounds each fact of an action split by `chunks`: an unframed
+ * fact (`max_unframed_fact_bytes`), with room for what the journal adds
+ * (IDs, sequence numbers, the author's previous fact).
+ */
+export const chunkBytes = maxUnframedFactBytes - 4096;
+
+/** oneFactBytes bounds a fact sent as one, framed if need be (`max_framed_fact_bytes`), with the same room. */
+export const oneFactBytes = maxFactBytes - 4096;
+
+const bodyBytes = (b: FactBody) => utf8(canonical({ type: b.type, targets: b.targets, payload: b.payload, dependencies: b.dependencies ?? [] })).length;
+
+/** fitsIn says whether a fact's body is within `bytes`. */
+export const fitsIn = (b: FactBody, bytes: number) => bodyBytes(b) <= bytes;
+
+/**
+ * chunks splits an action on a list of episodes (an Inbox's or a queue's
+ * cohort, a selection) into facts of consecutive parts, each within
+ * `bytes` (chunkBytes), so any number of episodes goes as facts the server accepts
+ * (PROTOCOL §6.13: large logical batches are several facts). It is only for
+ * actions whose effect is per episode (dismissals, queue removals). An
+ * episode too large for a part of its own goes alone. Nothing to act on is
+ * one fact, as before.
+ */
+export function chunks<T>(items: T[], build: (part: T[]) => FactBody, bytes = chunkBytes): FactBody[] {
+  if (items.length === 0) return [build(items)];
+  const sample = items.slice(0, 64);
+  const perItem = bodyBytes(build(sample)) / sample.length;
+  let per = Math.max(1, Math.floor((bytes * 0.8) / perItem));
+  for (;;) {
+    const out: FactBody[] = [];
+    let fits = true;
+    for (let i = 0; i < items.length && fits; i += per) {
+      const b = build(items.slice(i, i + per));
+      if (per > 1 && bodyBytes(b) > bytes) fits = false;
+      else out.push(b);
+    }
+    if (fits) return out;
+    per = Math.max(1, Math.floor(per / 2));
+  }
+}
+
+/** dismissAll is Remove all from inbox: exactly the observed NEW episodes, in as many facts as they need. */
+export const dismissAll = (es: EpisodeRow[]): FactBody[] => chunks(es, (part) => dismiss(part, true));
+
+/** The actions `chunks` splits, by the payload member that lists their episodes. */
+const splitLists: Record<string, string> = { "inbox.dismiss": "episodes", "inbox.dismiss_all": "episodes", "queue.remove": "episodes", "queue.clear": "observed" };
+
+/**
+ * resplit is `chunks` for an action an earlier version journaled as one fact
+ * (before list actions were split): the same action, its episodes in their
+ * order, as facts that fit. The first carries every dependency the whole
+ * fact observed, and the others follow it in its author's chain, so each
+ * observes all that the whole fact did. Null: an action that is not split.
+ */
+export function resplit(f: Fact): FactBody[] | null {
+  const key = splitLists[f.type];
+  const list = key ? f.payload[key] : undefined;
+  if (!key || !Array.isArray(list) || list.length < 2) return null;
+  const refs = list as EpisodeRef[];
+  const build = (part: EpisodeRef[]): FactBody => ({ type: f.type, type_version: f.type_version, targets: sortTargets(part.map(target)), payload: { ...f.payload, [key]: part } });
+  const observed = f.dependencies.filter((d) => d !== f.previous_op_id);
+  const first = (n: number): FactBody => ({ ...build(refs.slice(0, n)), dependencies: observed });
+  // The first fact takes as many episodes as fit beside the dependencies (one at least).
+  let lo = 1;
+  let hi = Math.min(refs.length, Math.floor(chunkBytes / 64)); // an EpisodeRef is longer than 64 bytes
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (bodyBytes(first(mid)) <= chunkBytes) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo === refs.length ? [first(lo)] : [first(lo), ...chunks(refs.slice(lo), build)];
 }
 
 // ---- history (PROTOCOL §8)
@@ -203,11 +279,15 @@ function podcastTarget(p: PodcastRow): Target[] {
   return [{ entity: "podcast", id: p.podcast_id, generation }];
 }
 
-export function subscribe(feedURL: string, opts: { observed?: PodcastRow; secretId?: string } = {}): FactBody {
+/**
+ * subscribe subscribes to a feed. observed is the podcast as the person saw
+ * it: a preview's, or a removed one's (PROTOCOL §7.2: a re-subscribe that
+ * observed the removal opens a fresh generation).
+ */
+export function subscribe(feedURL: string, opts: { observed?: { podcast_id: string; generation_id?: string; state: string }; secretId?: string } = {}): FactBody {
   const payload: Record<string, unknown> = { feed_url: feedURL };
   if (opts.observed) {
-    const generation = (opts.observed as { generation_id?: string }).generation_id;
-    payload.observed = { podcast_id: opts.observed.podcast_id, generation_id: generation, state: opts.observed.state };
+    payload.observed = { podcast_id: opts.observed.podcast_id, generation_id: opts.observed.generation_id, state: opts.observed.state };
   }
   if (opts.secretId) payload.credentials_secret = opts.secretId;
   return { type: "podcast.subscribe", targets: opts.observed ? [{ entity: "podcast", id: opts.observed.podcast_id }] : [], payload };

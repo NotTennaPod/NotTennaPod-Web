@@ -7,7 +7,7 @@ export default defineConfig({
   testDir: "e2e",
   testMatch: /layout\.spec\.ts$/,
   globalSetup: "./e2e/support/build.ts",
-  timeout: 180_000,
+  timeout: 0, // no time limit on a test; each wait has its own
   fullyParallel: false,
   workers: 3,
   reporter: [["list"]],

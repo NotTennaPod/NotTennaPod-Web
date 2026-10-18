@@ -34,6 +34,21 @@ export function compareKeys(a: QueueKey, b: QueueKey): number {
   return l < r ? -1 : l > r ? 1 : 0;
 }
 
+/**
+ * keyOrder is a string whose order (code unit by code unit) is the keys'
+ * numeric order: the key m / 2^n lies in [2^-(z+1), 2^-z) for z = n -
+ * bitLength(m) leading zero bits, so the string is MAX_EXPONENT - z in seven
+ * hex digits, then m's hex digits from its highest bit (shifted to a whole
+ * digit), padded with zeros: an odd m ends in a one bit, so of two keys with
+ * the same z the one whose digits run on is the greater, as string order has
+ * it.
+ */
+export function keyOrder(k: QueueKey): string {
+  const bits = bitLength(k.m);
+  const z = k.n - bits;
+  return (MAX_EXPONENT - z).toString(16).padStart(7, "0") + (k.m << BigInt((4 - (bits % 4)) % 4)).toString(16);
+}
+
 function bitLength(x: bigint): number {
   return x === 0n ? 0 : x.toString(2).length;
 }

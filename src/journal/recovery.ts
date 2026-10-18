@@ -106,20 +106,36 @@ export async function recoveryState(db: IDBDatabase, account: string): Promise<R
  * recover runs the recorded recovery as far as it can now. It returns null
  * when there is none to run. Network and busy errors are thrown, and the
  * caller retries; what was done stays done.
+ *
+ * A server that answers that the recovery is not open (it lost the session,
+ * PROTOCOL §6.11) has it opened again, once per attempt, as the phone opens
+ * it on every exchange: every step is idempotent by ID, so the attempt goes on
+ * where it was instead of retrying a session that no longer exists.
  */
 export async function recover(db: IDBDatabase, account: string, api: RecoveryTransport, bounds: Bounds = defaultBounds, inventoryBound = 2000): Promise<RecoveryState | null> {
+  try {
+    return await recoverOnce(db, account, api, bounds, inventoryBound);
+  } catch (e) {
+    if (!(e instanceof ApiError && e.status === 400 && e.code === "invalid_request")) throw e;
+    await updateInstallation(db, account, (r) => r.recovery && (r.recovery.opened = false));
+    return recoverOnce(db, account, api, bounds, inventoryBound);
+  }
+}
+
+async function recoverOnce(db: IDBDatabase, account: string, api: RecoveryTransport, bounds: Bounds, inventoryBound: number): Promise<RecoveryState | null> {
   let inst = (await tx(db, ["installations"], "readonly", (t) => req(t.objectStore("installations").get(account)))) as InstallationRow | undefined;
   // A successor handoff still under way has not moved the acknowledged entries
   // aside yet: until it finishes, there is nothing to judge (never "nothing to recover").
   if (!inst?.recovery || inst.recovery.finished || !inst.registered || inst.successor) return null;
+  // The evidence this attempt answers for: what arrives later is the next attempt's.
+  const attempt = { id: inst.recovery.recovery_id, evidence: inst.recovery.evidence ?? 0 };
   const state: RecoveryState = { done: false, recovered: 0, pending: 0, problems: 0 };
   const open = (await retained(db, account)).filter((e) => !(e.recovery && problems.has(e.recovery.status)));
   if (open.length === 0) {
     // Nothing (left) to send: a recovery with no entries needs no request.
     const counted = await recoveryState(db, account);
     if (inst.recovery.opened) await api.finish({ recovery_id: inst.recovery.recovery_id, complete: counted.problems === 0 });
-    await updateInstallation(db, account, (r) => r.recovery && (r.recovery.finished = true));
-    return { ...counted, done: true };
+    return { ...counted, done: await finished(db, account, attempt) };
   }
   if (!inst.recovery.opened) {
     try {
@@ -230,13 +246,29 @@ export async function recover(db: IDBDatabase, account: string, api: RecoveryTra
   const counted = await recoveryState(db, account);
   if (counted.pending === 0) {
     await api.finish({ recovery_id: recoveryId, complete: counted.problems === 0 });
-    await updateInstallation(db, account, (r) => r.recovery && (r.recovery.finished = true));
-    return { ...counted, recovered: state.recovered, done: true };
+    return { ...counted, recovered: state.recovered, done: await finished(db, account, attempt) };
   }
   // Entries still waiting for a dependency another device may restore: the
   // recovery stays open and is tried again later; the server records progress.
   await api.finish({ recovery_id: recoveryId, complete: false });
   return { ...counted, recovered: state.recovered, done: false };
+}
+
+/**
+ * finished records an attempt's recovery as done, unless evidence was kept
+ * for it after the attempt read what to send: then a new recovery is owed
+ * that evidence (the server has this one finished), and the attempt is not done.
+ */
+async function finished(db: IDBDatabase, account: string, attempt: { id: string; evidence: number }): Promise<boolean> {
+  let done = false;
+  await updateInstallation(db, account, (r) => {
+    if (r.recovery?.recovery_id !== attempt.id) return;
+    if ((r.recovery.evidence ?? 0) === attempt.evidence) {
+      r.recovery.finished = true;
+      done = true;
+    } else r.recovery = { recovery_id: uuid(), opened: false, finished: false };
+  });
+  return done;
 }
 
 /** jsonBytes is a value's size as a request carries it (JSON.stringify, UTF-8). */

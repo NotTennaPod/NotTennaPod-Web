@@ -21,7 +21,7 @@ test("a successor renumbers unacknowledged facts unchanged and keeps acknowledge
   const receipt = { op_id: e1.op_id, content_hash: "h", outcome: "applied" as const, normalized_time: 1, epoch: 1, seq: 2, index: 0, key_id: "k", mac: "m" };
   await acknowledge(db, account, [{ install_seq: 1, receipt }], { log_id: "old", epoch: 1 });
   const sent: Record<string, unknown>[] = [];
-  const after = await takeSuccessor(db, account, async (b) => void sent.push(b), { freshNonce: false, device });
+  const after = await takeSuccessor(db, account, async (b) => void sent.push(b), { from: (await installation(db, account)).install_id, freshNonce: false, device });
   assert.notEqual(after.install_id, before.install_id);
   assert.equal(after.instance_nonce, before.instance_nonce); // a restore keeps the profile's nonce
   assert.deepEqual(after.predecessors, [before.install_id]);
@@ -43,9 +43,32 @@ test("a handoff interrupted after the request repeats with the same IDs", async 
   const a = await newAuthor(db, account);
   await append(db, account, a.author_id, note("x"));
   const ids: string[] = [];
-  await assert.rejects(takeSuccessor(db, account, async (b) => { ids.push(b.install_id); throw new Error("offline"); }, { freshNonce: true, device }));
-  const done = await takeSuccessor(db, account, async (b) => void ids.push(b.install_id), { freshNonce: true, device });
+  await assert.rejects(takeSuccessor(db, account, async (b) => { ids.push(b.install_id); throw new Error("offline"); }, { from: (await installation(db, account)).install_id, freshNonce: true, device }));
+  const done = await takeSuccessor(db, account, async (b) => void ids.push(b.install_id), { from: (await installation(db, account)).install_id, freshNonce: true, device });
   assert.equal(ids[0], ids[1]);
   assert.equal(done.install_id, ids[0]);
   assert.equal((await entries(db, account))[0]!.install_id, done.install_id);
+});
+
+test("a tab that saw another tab's handoff in progress takes no second successor once that one is done", async () => {
+  // Two tabs of one profile see one restore: tab b plans and registers the successor; tab a's push loop saw
+  // b's plan in progress, and by the time it finishes it, b has. One lineage change takes one successor.
+  const db = await openDB(indexedDB, `succ-${++n}`);
+  const account = crypto.randomUUID();
+  const before = await installation(db, account);
+  const a = await newAuthor(db, account);
+  const e1 = await append(db, account, a.author_id, note("pending"));
+  const ids: string[] = [];
+  const send = async (b: { install_id: string }) => void ids.push(b.install_id);
+  const taken = await takeSuccessor(db, account, send, { from: (await installation(db, account)).install_id, freshNonce: false, device }); // tab b
+  const again = await takeSuccessor(db, account, send, { freshNonce: false, device, from: before.install_id }); // tab a, late
+  assert.deepEqual(ids, [taken.install_id], "one successor registered");
+  assert.equal(again.install_id, taken.install_id);
+  assert.deepEqual(again.predecessors, [before.install_id]);
+  assert.deepEqual((await entries(db, account)).map((e) => [e.install_seq, e.op_id, e.install_id]), [[1, e1.op_id, taken.install_id]]);
+  // A handoff still in progress is finished with its own IDs, whoever saw it.
+  await assert.rejects(takeSuccessor(db, account, async () => { throw new Error("offline"); }, { from: (await installation(db, account)).install_id, freshNonce: false, device }));
+  const resumed = await takeSuccessor(db, account, send, { freshNonce: false, device, from: taken.install_id });
+  assert.deepEqual(resumed.predecessors, [before.install_id, taken.install_id]);
+  assert.equal(ids.length, 2);
 });

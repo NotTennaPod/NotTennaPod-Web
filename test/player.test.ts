@@ -7,10 +7,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { EpisodeRow, Summary } from "../src/api/views.ts";
 import { openDB, type Fact } from "../src/journal/db.ts";
-import { acknowledge, append, entries, installation, newAuthor, retire, updateInstallation } from "../src/journal/journal.ts";
+import { acknowledge, append, entries, installation, lineages, newAuthor, retire, retireLineage, updateInstallation } from "../src/journal/journal.ts";
 import { between, keyString, uuidValue, type QueueKey } from "../src/queue/keys.ts";
-import { Player, type Channel, type EpisodeView, type Media, type Message } from "../src/player/engine.ts";
-import { exportPending, getLease, listeningFrontier, sessionsOf, updateLease } from "../src/player/store.ts";
+import { Player, type Channel, type EpisodeView, type Media, type MediaListener, type Message, type PlayerDeps } from "../src/player/engine.ts";
+import { exportPending, getLease, inPlayer, listeningFrontier, sessionsOf, sessionsOfEpisode, updateLease } from "../src/player/store.ts";
 import { addToQueue, loadedHere } from "../src/app/queueOps.ts";
 import { retainedEntries, takeSuccessor } from "../src/journal/successor.ts";
 
@@ -27,9 +27,15 @@ class FakeMedia implements Media {
   rate = 1;
   failPlay = false;
   durations = new Map<string, number>();
-  #l: { paused(): void; ended(): void; time(): void; error(): void } | undefined;
-  listen(l: { paused(): void; ended(): void; time(): void; error(): void }) {
+  #l: MediaListener | undefined;
+  listen(l: MediaListener) {
     this.#l = l;
+  }
+  /** waiting is the element waiting for this device's connection (true), and no longer (false): the position holds meanwhile. */
+  #waiting = false;
+  waiting(on: boolean) {
+    this.#waiting = on;
+    this.#l?.waiting?.(on);
   }
   async load(url: string, position: number) {
     if (this.url !== url) {
@@ -59,7 +65,7 @@ class FakeMedia implements Media {
   }
   /** advance plays ms of wall time at the rate. */
   advance(ms: number) {
-    if (this.paused) return;
+    if (this.paused || this.#waiting) return;
     this.position += ms * this.rate;
     if (this.position >= this.duration) {
       this.position = this.duration;
@@ -175,7 +181,7 @@ class World {
   /** liveTabs are the tab IDs of the open pages: a duplicated tab finds its copied ID in use. */
   liveTabs = new Set<string>();
 
-  async page(tab: string = crypto.randomUUID(), media = new FakeMedia()) {
+  async page(tab: string = crypto.randomUUID(), media = new FakeMedia(), deps: Partial<PlayerDeps> = {}) {
     const db = await openDB(indexedDB, this.name); // a tab has its own connection
     const author = await newAuthor(db, this.account);
     const channel = new FakeChannel(this.hub);
@@ -187,6 +193,7 @@ class World {
       storageFailed: "storage failed",
       tabInUse: async (t) => this.liveTabs.has(t),
       newTab: () => (mine = crypto.randomUUID()),
+      ...deps,
     });
     await player.boot();
     this.liveTabs.add(mine);
@@ -218,15 +225,44 @@ class World {
   async acknowledgeAll() {
     const all = await entries(this.db, this.account);
     this.head = { ...this.head, seq: this.head.seq + 1 };
+    const epoch = this.head.epoch;
     await acknowledge(
       this.db,
       this.account,
       all.filter((e) => !e.receipt).map((e) => ({
         install_seq: e.install_seq,
-        receipt: { op_id: e.op_id, content_hash: "h", outcome: "applied", normalized_time: 0, epoch: 1, seq: this.head.seq, index: 0, key_id: "k", mac: "m" },
+        receipt: { op_id: e.op_id, content_hash: "h", outcome: "applied", normalized_time: 0, epoch, seq: this.head.seq, index: 0, key_id: "k", mac: "m" },
       })),
-      { log_id: this.head.log_id, epoch: 1 },
+      { log_id: this.head.log_id, epoch },
     );
+  }
+
+  /**
+   * write is the server applying another device's write of an episode's
+   * position (a start, a checkpoint, a completion): its claim, a new
+   * provenance node, the device's listening time, and the head moving on.
+   */
+  write(id: string, o: { claim: string; position: number; lastPlayed?: number; generation?: string }) {
+    const v = this.views.get(id)!;
+    this.head = { ...this.head, seq: this.head.seq + 1 };
+    v.episode.position = o.position;
+    v.episode.last_played = o.lastPlayed ?? this.clock;
+    v.episode.records.position = { value: { generation_id: o.generation ?? gen, position: o.position, claim_id: o.claim }, provenance: [o.claim, crypto.randomUUID()].sort() };
+  }
+
+  /**
+   * restore is the server restored from a backup (a new epoch of its log), or
+   * replaced by another log; shown says a view of it was shown, so the
+   * profile moved to it and retired the lineage it left (Sync.shown).
+   */
+  async restore(o: { log?: string; shown?: boolean } = {}) {
+    const old = this.head;
+    this.head = o.log ? { cursor: "c", log_id: o.log, epoch: 1, seq: 1 } : { ...old, epoch: old.epoch + 1 };
+    if (o.shown === false) return;
+    await updateInstallation(this.db, this.account, (r) => {
+      r.lineage ??= { log_id: old.log_id, epoch: old.epoch };
+      retireLineage(r, this.head);
+    });
   }
 }
 
@@ -463,6 +499,47 @@ test("an episode the browser cannot play directly says so and writes nothing", a
   a.media.failPlay = true;
   await a.player.play(f);
   assert.equal((await w.facts()).length, 0, "a media error before playback writes nothing");
+});
+
+test("while the media waits for the connection the player shows it buffering, still playing and with no error, also across Pause and Play", async () => {
+  const w = await new World().init();
+  const e = w.episode(1, { queued: true });
+  const a = await w.page();
+  await a.player.play(e);
+  await w.listen(a, 3_000);
+  a.media.waiting(true);
+  assert.deepEqual([a.player.state.busy, a.player.state.playing, a.player.state.error], [true, true, null]);
+  await a.player.pause();
+  a.media.waiting(false); // Pause ended the wait
+  assert.equal(a.player.state.busy, false);
+  const resumed = a.player.play();
+  a.media.waiting(true); // Play waits again
+  await resumed;
+  assert.deepEqual([a.player.state.busy, a.player.state.playing], [true, true], "a play under way does not hide the wait");
+  a.media.waiting(false);
+  assert.equal(a.player.state.busy, false);
+});
+
+test("an hour of waiting for the connection at one position writes no saves; listening on saves again", async () => {
+  const w = await new World().init();
+  const e = w.episode(1, { queued: true });
+  const a = await w.page();
+  await a.player.play(e);
+  await w.listen(a, 7_000);
+  a.media.waiting(true);
+  await w.listen(a, 5_000); // the position last saved, if the last save was before it, is saved once
+  const [before] = await sessionsOfEpisode(a.db, w.account, e.episode_id);
+  const facts = (await w.facts()).length;
+  await w.listen(a, 60 * minute);
+  const [after] = await sessionsOfEpisode(a.db, w.account, e.episode_id);
+  assert.equal(after!.saves, before!.saves, "no saves while waiting at the same position");
+  assert.equal((await w.facts()).length, facts, "no checkpoints");
+  assert.equal(after!.last.position, before!.last.position);
+  a.media.waiting(false);
+  await w.listen(a, 6_000);
+  const [later] = await sessionsOfEpisode(a.db, w.account, e.episode_id);
+  assert.ok(later!.saves > after!.saves, "listening on saves again");
+  assert.ok(later!.last.position > after!.last.position);
 });
 
 test("a reload restores the episode paused without a fact, exports what was left passively, and resumes the same session", async () => {
@@ -729,6 +806,36 @@ test("when the playing tab closes, another tab exports its last saves once its l
   wellFormed(await w.facts());
 });
 
+test("a page that goes for good lets go of its media after its last save has the position; a page kept to come back to keeps it", async () => {
+  const w = await new World().init();
+  const e = w.episode(1, { queued: true });
+  const kept = await w.page();
+  await kept.player.play(e);
+  await w.listen(kept, 7_000);
+  kept.player.pageHidden(true);
+  await kept.player.idle();
+  assert.equal(kept.media.url, "https://media.test/1.wav", "a page kept to come back to keeps its media");
+  await kept.player.pause();
+  kept.player.dispose();
+  const a = await w.page();
+  await a.player.play();
+  await w.listen(a, 3_000);
+  const unload = a.media.unload.bind(a.media);
+  a.media.unload = () => {
+    unload();
+    a.media.position = 0; // as the element: no source, no time
+  };
+  a.player.pageHidden(false);
+  await a.player.idle();
+  assert.equal(a.media.url, null, "the page let go of its media");
+  // The first page's paused session stays open too (only its own page load appends to it), so the
+  // place is read from this page's own session.
+  const mine = (await sessionsOf(w.db, w.account)).filter((s) => s.author_id === a.author && !s.sealed && !s.closed);
+  assert.equal(mine.length, 1, "the page has one open session");
+  const last = mine[0]!.last;
+  assert.ok(last.position >= 9_000, `the last save has the position: ${last.position}`);
+});
+
 test("continuous playback into an episode the browser cannot play shows that episode with the relay message", async () => {
   const w = await new World().init();
   const e1 = w.episode(1, { queued: true, duration: minute });
@@ -897,7 +1004,7 @@ test("a predecessor's late receipt is kept as recovery evidence", async () => {
   const w = await new World().init();
   const author = await newAuthor(w.db, w.account);
   const e = await append(w.db, w.account, author.author_id, { type: "history.clear", targets: [], payload: {} });
-  await takeSuccessor(w.db, w.account, async () => {}, { freshNonce: false, device: { name: "test", app_version: "0", capabilities: [] } });
+  await takeSuccessor(w.db, w.account, async () => {}, { from: (await installation(w.db, w.account)).install_id, freshNonce: false, device: { name: "test", app_version: "0", capabilities: [] } });
   const receipt = { op_id: e.op_id, content_hash: "h", outcome: "applied" as const, normalized_time: w.clock, epoch: 1, seq: 2, index: 0, key_id: "k", mac: "m" };
   await acknowledge(w.db, w.account, [{ install_seq: e.install_seq, receipt }], { log_id: "old", epoch: 1 }, e.install_id);
   const retained = await retainedEntries(w.db, w.account);
@@ -1362,4 +1469,1100 @@ test("a kept paused seek gives way to another device's newer position, and is th
   const c = await w.page("tab");
   assert.ok(!(await sessionsOf(w.db, w.account)).some((s) => s.session_id === p(start1).session_id), "the superseded seek is not kept");
   c.player.dispose();
+});
+
+// ---- the newest position (PROTOCOL §8.6): the record's version, READY and restores
+
+/** paused plays an episode for a while and pauses, with everything acknowledged: another device's write is then newer. */
+async function pausedAfterListening(w: World, tab?: string) {
+  const e = w.episode(1, { queued: true });
+  const a = await w.page(tab);
+  await a.player.play(e);
+  await w.listen(a, 20_000);
+  await a.player.pause();
+  await w.acknowledgeAll();
+  return { e, a };
+}
+
+const superseded = (facts: Fact[]) => of(facts, "session.end").filter((f) => p(f).reason === "superseded");
+
+test("a paused player follows another device's claim moving on, and Play starts where that device paused", async () => {
+  const w = await new World().init();
+  const { e, a } = await pausedAfterListening(w);
+  const phone = crypto.randomUUID();
+  w.clock += 60_000;
+  w.write(e.episode_id, { claim: phone, position: 300_000 });
+  await a.player.refresh();
+  assert.equal(a.player.state.position, 300_000);
+  // The phone plays on and pauses under the same claim: its checkpoint moves the record.
+  w.clock += 120_000;
+  w.write(e.episode_id, { claim: phone, position: 420_000 });
+  await a.player.refresh();
+  assert.equal(a.player.state.position, 420_000, "the same claim moving on is adopted");
+  assert.equal(a.media.position, 420_000);
+  assert.equal(superseded(await w.facts()).length, 1, "the session was sealed once, at the first adoption");
+  w.clock += 1_000;
+  await a.player.play();
+  const start = of(await w.facts(), "session.start").at(-1)!;
+  assert.equal(p(start).start_position, 420_000 - 800);
+  assert.equal(p(start).observed_claim, phone);
+  wellFormed(await w.facts());
+});
+
+test("a completion under the same claim, back to the position held before, is adopted over a seek made here", async () => {
+  const w = await new World().init();
+  const { e, a } = await pausedAfterListening(w);
+  const phone = crypto.randomUUID();
+  w.clock += 60_000;
+  w.write(e.episode_id, { claim: phone, position: 0 }); // the phone starts it from the beginning
+  await a.player.refresh();
+  assert.equal(a.player.state.position, 0);
+  await a.player.seek(120_000);
+  // The phone listens to the end; none of its checkpoints reach this page, its completion puts the position back to 0.
+  w.clock += 600_000;
+  w.write(e.episode_id, { claim: phone, position: 0 });
+  w.views.get(e.episode_id)!.episode.play_state = "played";
+  await a.player.refresh();
+  assert.equal(a.player.state.position, 0);
+  w.clock += 1_000;
+  await a.player.play();
+  const start = of(await w.facts(), "session.start").at(-1)!;
+  assert.deepEqual([p(start).start_position, p(start).observed_claim], [0, phone]);
+});
+
+test("a seek made here while paused stands while the record is unchanged, also after a reload", async () => {
+  const w = await new World().init();
+  const { e, a } = await pausedAfterListening(w, "tab");
+  const phone = crypto.randomUUID();
+  w.clock += 60_000;
+  w.write(e.episode_id, { claim: phone, position: 300_000 });
+  await a.player.refresh();
+  await a.player.seek(120_000);
+  await a.player.refresh();
+  assert.equal(a.player.state.position, 120_000);
+  a.player.dispose();
+  w.clock += 5_000;
+  const b = await w.page("tab");
+  await b.player.refresh();
+  assert.equal(b.player.state.position, 120_000, "the record the page decided against is kept with the profile");
+  w.clock += 1_000;
+  await b.player.play();
+  const start = of(await w.facts(), "session.start").at(-1)!;
+  assert.deepEqual([p(start).start_position, p(start).observed_claim], [120_000 - 800, phone]);
+  assert.equal(superseded(await w.facts()).length, 1);
+});
+
+/** preparing gives a page media whose load runs during() once, as another device's write landing while the media prepares. */
+function preparing(during: () => void): FakeMedia {
+  const media = new FakeMedia();
+  const load = media.load.bind(media);
+  let once = true;
+  media.load = async (url, position) => {
+    await load(url, position);
+    if (once) during();
+    once = false;
+  };
+  return media;
+}
+
+test("a newer claim read while the media prepares is where Play starts (READY)", async () => {
+  const w = await new World().init();
+  const e = w.episode(1, { queued: true, position: 100_000, claim: crypto.randomUUID() });
+  const phone = crypto.randomUUID();
+  let a!: Awaited<ReturnType<World["page"]>>;
+  a = await w.page("a", preparing(() => {
+    w.write(e.episode_id, { claim: phone, position: 300_000 });
+    void a.player.refresh(); // the event stream announces it
+  }));
+  await a.player.play(e);
+  const start = of(await w.facts(), "session.start")[0]!;
+  assert.deepEqual([p(start).start_position, p(start).observed_claim], [300_000, phone]);
+  assert.equal(a.media.position, 300_000);
+});
+
+test("the same claim moving on while the media prepares is where Play starts (READY)", async () => {
+  const w = await new World().init();
+  const other = crypto.randomUUID();
+  const e = w.episode(1, { queued: true, position: 100_000, claim: other });
+  let a!: Awaited<ReturnType<World["page"]>>;
+  a = await w.page("a", preparing(() => {
+    w.write(e.episode_id, { claim: other, position: 300_000 });
+    void a.player.refresh(); // the event stream announces it
+  }));
+  await a.player.play(e);
+  const start = of(await w.facts(), "session.start")[0]!;
+  assert.deepEqual([p(start).start_position, p(start).observed_claim], [300_000, other]);
+});
+
+test("Pause while the media prepares: READY adopts and starts nothing; the next refresh adopts", async () => {
+  const w = await new World().init();
+  const e = w.episode(1, { queued: true, position: 100_000, claim: crypto.randomUUID() });
+  const phone = crypto.randomUUID();
+  let a!: Awaited<ReturnType<World["page"]>>;
+  a = await w.page("a", preparing(() => {
+    w.write(e.episode_id, { claim: phone, position: 300_000 });
+    void a.player.pause();
+  }));
+  await a.player.play(e);
+  await a.player.idle();
+  assert.equal(of(await w.facts(), "session.start").length, 0);
+  assert.equal(a.player.state.position, 100_000, "READY decided nothing after Pause");
+  await a.player.refresh();
+  assert.equal(a.player.state.position, 300_000, "a paused player adopts");
+  assert.equal(a.media.paused, true);
+});
+
+test("our own claim the server has not had yet wins over an older record when an episode is played again", async () => {
+  const w = await new World().init();
+  const other = crypto.randomUUID();
+  const e1 = w.episode(1, { queued: true, position: 50_000, claim: other });
+  const e2 = w.episode(2, { queued: true });
+  const a = await w.page();
+  await a.player.play(e1);
+  await w.listen(a, 10_000);
+  await a.player.pause();
+  await a.player.play(e2);
+  await w.listen(a, 3_000);
+  w.clock += 1_000;
+  await a.player.play(e1); // the view still shows the other claim: ours is unsent
+  const facts = await w.facts();
+  const again = of(facts, "session.start").filter((f) => p(f).episode.episode_id === e1.episode_id)[1]!;
+  assert.equal(p(again).start_position, 60_000 - 800);
+  assert.equal(superseded(facts).length, 0);
+});
+
+test("our own claim kept on a load that could not start is decided again once the server has it", async () => {
+  const w = await new World().init();
+  const e1 = w.episode(1, { queued: true });
+  const e2 = w.episode(2, { queued: true });
+  const a = await w.page();
+  await a.player.play(e1); // P, unsent
+  await w.listen(a, 10_000);
+  await a.player.pause();
+  await a.player.play(e2);
+  await w.listen(a, 3_000);
+  await a.player.pause();
+  // Another device plays episode 1 after P; this load keeps P's position while P is unsent, and cannot start.
+  const phone = crypto.randomUUID();
+  w.clock += 30_000;
+  w.write(e1.episode_id, { claim: phone, position: 300_000 });
+  a.media.failPlay = true;
+  await a.player.play(e1);
+  assert.equal(a.player.state.position, 10_000);
+  a.media.failPlay = false;
+  await w.acknowledgeAll(); // P is in: the phone's claim is later
+  await a.player.refresh();
+  assert.equal(a.player.state.position, 300_000, "the record seen while P was pending was never taken as decided");
+});
+
+test("a reset made elsewhere while our start was unsent is adopted once the server has our start; if ours wins, the player stays", async () => {
+  for (const variant of ["theirs", "theirs, after a reload", "ours"] as const) {
+    const w = await new World().init();
+    const e = w.episode(1, { queued: true });
+    let a = await w.page("tab");
+    await a.player.play(e); // P, unsent
+    await w.listen(a, 10_000);
+    await a.player.pause();
+    await a.player.seek(120_000);
+    const own = of(await w.facts(), "session.start")[0]!;
+    // Another device resets the episode (claim c, later than P): the record shows c while P is unsent.
+    const c = crypto.randomUUID();
+    w.write(e.episode_id, { claim: c, position: 0 });
+    await a.player.refresh();
+    assert.equal(a.player.state.position, 120_000, variant);
+    assert.equal(superseded(await w.facts()).length, 0, variant);
+    if (variant === "theirs, after a reload") {
+      a.player.dispose();
+      a = await w.page("tab");
+      assert.equal(a.player.state.position, 120_000, variant);
+    }
+    await w.acknowledgeAll(); // P reaches the server in a later unit
+    if (variant === "ours") w.write(e.episode_id, { claim: own.op_id, position: 10_000 }); // P ordered last: the record is ours
+    await a.player.refresh();
+    if (variant === "ours") {
+      assert.equal(a.player.state.position, 120_000, variant);
+      assert.equal(superseded(await w.facts()).length, 0, variant);
+      continue;
+    }
+    assert.equal(a.player.state.position, 0, variant);
+    assert.equal(superseded(await w.facts()).length, 1, variant);
+    w.clock += 1_000;
+    await a.player.play();
+    const start = of(await w.facts(), "session.start").at(-1)!;
+    assert.deepEqual([p(start).start_position, p(start).observed_claim], [0, c], variant);
+    wellFormed(await w.facts());
+  }
+});
+
+test("a restore that shows an older record never moves a paused player, also after a reload; Play starts where it stood", async () => {
+  const w = await new World().init();
+  const first = await pausedAfterListening(w, "tab");
+  const e = first.e;
+  let a = first.a;
+  const c1 = crypto.randomUUID();
+  const c2 = crypto.randomUUID();
+  w.clock += 60_000;
+  w.write(e.episode_id, { claim: c1, position: 300_000 });
+  const c1Played = w.clock;
+  await a.player.refresh();
+  w.clock += 60_000;
+  w.write(e.episode_id, { claim: c2, position: 400_000 });
+  await a.player.refresh();
+  assert.equal(a.player.state.position, 400_000);
+  await retire(w.db, w.account, w.head); // views showed everything the browser sent
+  const seals = superseded(await w.facts()).length;
+  // The server is restored from a backup in which c1 is the latest write: an older record.
+  await w.restore();
+  w.write(e.episode_id, { claim: c1, position: 300_000, lastPlayed: c1Played });
+  await a.player.refresh();
+  await a.player.refresh();
+  assert.equal(a.player.state.position, 400_000);
+  a.player.dispose();
+  a = await w.page("tab");
+  await a.player.refresh();
+  assert.equal(a.player.state.position, 400_000, "the restored record was taken as the baseline, not adopted");
+  assert.equal(superseded(await w.facts()).length, seals);
+  w.clock += 1_000;
+  await a.player.play();
+  const start = of(await w.facts(), "session.start").at(-1)!;
+  // From where it stood, rewound as Android does after more than a minute; observing the record it saw.
+  assert.deepEqual([p(start).start_position, p(start).observed_claim], [400_000 - 3_000, c1]);
+});
+
+test("after a restore, a claim never seen moves the player only with listening newer than all it knew", async () => {
+  const w = await new World().init();
+  const { e, a } = await pausedAfterListening(w);
+  w.clock += 60_000;
+  w.write(e.episode_id, { claim: crypto.randomUUID(), position: 300_000 });
+  const known = w.clock;
+  await a.player.refresh();
+  await retire(w.db, w.account, w.head);
+  await w.restore();
+  w.write(e.episode_id, { claim: crypto.randomUUID(), position: 100_000, lastPlayed: known - 1 });
+  await a.player.refresh();
+  assert.equal(a.player.state.position, 300_000, "older listening: a baseline only");
+  await w.restore();
+  const later = crypto.randomUUID();
+  w.clock += 60_000;
+  w.write(e.episode_id, { claim: later, position: 500_000 });
+  await a.player.refresh();
+  assert.equal(a.player.state.position, 500_000, "newer listening: adopted");
+});
+
+test("restores showing ever older listening never move the player: what it knew does not go down", async () => {
+  const w = await new World().init();
+  const { e, a } = await pausedAfterListening(w);
+  const t0 = w.clock;
+  w.write(e.episode_id, { claim: crypto.randomUUID(), position: 300_000, lastPlayed: t0 + 500_000 });
+  await a.player.refresh();
+  assert.equal(a.player.state.position, 300_000);
+  await retire(w.db, w.account, w.head);
+  await w.restore();
+  w.write(e.episode_id, { claim: crypto.randomUUID(), position: 100_000, lastPlayed: t0 + 300_000 });
+  await a.player.refresh();
+  await w.restore();
+  w.write(e.episode_id, { claim: crypto.randomUUID(), position: 200_000, lastPlayed: t0 + 400_000 });
+  await a.player.refresh();
+  assert.equal(a.player.state.position, 300_000);
+  assert.equal((await getLease(w.db, w.account)).current?.listened, t0 + 500_000);
+});
+
+test("listening a restored server shows while our own claim is pending is adopted once that claim is in, also after a reload", async () => {
+  for (const reload of [false, true]) {
+    const w = await new World().init();
+    const e = w.episode(1, { queued: true, position: 50_000, claim: crypto.randomUUID() });
+    let a = await w.page("tab");
+    await a.player.play(e); // P, unsent
+    await w.listen(a, 10_000);
+    await a.player.pause();
+    // The server is restored; there another device played the episode to its end after this browser paused: its claim c, at 0.
+    await w.restore();
+    const c = crypto.randomUUID();
+    w.clock += 60_000;
+    w.write(e.episode_id, { claim: c, position: 0 });
+    await a.player.refresh(); // P is pending: nothing is decided
+    assert.equal(a.player.state.position, 60_000);
+    if (reload) {
+      a.player.dispose();
+      a = await w.page("tab");
+      assert.equal(a.player.state.position, 60_000);
+    }
+    await w.acknowledgeAll(); // P reaches the restored server; c, later, still owns the record
+    await a.player.refresh();
+    assert.equal(a.player.state.position, 0, `adopted${reload ? " after a reload" : ""}`);
+    assert.equal(superseded(await w.facts()).length, 1);
+    w.clock += 1_000;
+    await a.player.play();
+    const start = of(await w.facts(), "session.start").at(-1)!;
+    assert.deepEqual([p(start).start_position, p(start).observed_claim], [0, c]);
+    wellFormed(await w.facts());
+  }
+});
+
+test("a late view of the lineage the profile left is never used", async () => {
+  const w = await new World().init();
+  const { e, a } = await pausedAfterListening(w);
+  await retire(w.db, w.account, w.head);
+  const left = w.head;
+  await w.restore();
+  const late = crypto.randomUUID();
+  w.clock += 60_000;
+  w.write(e.episode_id, { claim: late, position: 300_000 });
+  const view = structuredClone(w.views.get(e.episode_id)!);
+  const read = w.reads.episode;
+  w.reads.episode = async () => ({ ...view, head: { ...left, seq: left.seq + 50 } }); // answered by the server before its restore
+  await a.player.refresh();
+  assert.equal(a.player.state.position, 20_000);
+  assert.equal(superseded(await w.facts()).length, 0);
+  w.reads.episode = read;
+  await a.player.refresh(); // the same write, read from the restored server
+  assert.equal(a.player.state.position, 300_000);
+});
+
+test("a restored epoch's view wins over the old epoch's, whatever their seq", async () => {
+  const w = await new World().init();
+  w.head = { ...w.head, seq: 1000 };
+  const e = w.episode(1, { queued: true, position: 100_000, claim: crypto.randomUUID() });
+  const phone = crypto.randomUUID();
+  // The server is restored while the media prepares (no view of it shown yet), at a smaller seq; a device listened since.
+  let a!: Awaited<ReturnType<World["page"]>>;
+  a = await w.page("a", preparing(() => {
+    void w.restore({ shown: false });
+    w.head = { ...w.head, seq: 100 };
+    w.write(e.episode_id, { claim: phone, position: 300_000 });
+    void a.player.refresh(); // the event stream announces the change
+  }));
+  await a.player.play(e);
+  const start = of(await w.facts(), "session.start")[0]!;
+  assert.deepEqual([p(start).start_position, p(start).observed_claim], [300_000, phone]);
+  assert.deepEqual((await lineages(w.db, w.account)).lineage, null);
+});
+
+test("a row saved before the record's version was kept: its first view moves the player only on newer listening, later writes always", async () => {
+  for (const newer of [false, true]) {
+    const w = await new World().init();
+    const { e, a } = await pausedAfterListening(w, "tab");
+    const paused = w.clock;
+    const phone = crypto.randomUUID();
+    w.write(e.episode_id, { claim: phone, position: 300_000, lastPlayed: paused - 5_000 }); // ordered after ours, listened before our pause
+    await a.player.refresh();
+    assert.equal(a.player.state.position, 300_000);
+    await a.player.seek(120_000); // a seek made here while paused
+    a.player.dispose();
+    await updateLease(w.db, w.account, (l) => {
+      delete l.current!.observed;
+      delete l.current!.listened;
+    });
+    w.clock += 60_000;
+    if (newer) w.write(e.episode_id, { claim: phone, position: 420_000 }); // the phone played on while the page was closed
+    const b = await w.page("tab");
+    await b.player.refresh();
+    if (newer) {
+      assert.equal(b.player.state.position, 420_000, "newer listening is adopted at once");
+      continue;
+    }
+    assert.equal(b.player.state.position, 120_000, "no newer listening: the record becomes the baseline, and the seek stands");
+    assert.equal(superseded(await w.facts()).length, 1);
+    w.write(e.episode_id, { claim: phone, position: 420_000 });
+    await b.player.refresh();
+    assert.equal(b.player.state.position, 420_000, "then the claim moving on is followed");
+    w.clock += 1_000;
+    await b.player.play();
+    const start = of(await w.facts(), "session.start").at(-1)!;
+    assert.deepEqual([p(start).start_position, p(start).observed_claim], [420_000 - 800, phone]);
+  }
+});
+
+test("another generation's record is not ordered against the old one: only newer listening moves the player", async () => {
+  const w = await new World().init();
+  const { e, a } = await pausedAfterListening(w);
+  w.clock += 60_000;
+  w.write(e.episode_id, { claim: crypto.randomUUID(), position: 300_000 });
+  await a.player.refresh();
+  // The podcast was subscribed again: a new generation, whose record an older listening wrote.
+  const gen2 = "g1:" + "c".repeat(64);
+  w.views.get(e.episode_id)!.episode.podcast.generation_id = gen2;
+  const d = crypto.randomUUID();
+  w.write(e.episode_id, { claim: d, position: 50_000, generation: gen2, lastPlayed: w.clock - 30_000 });
+  await a.player.refresh();
+  assert.equal(a.player.state.position, 300_000);
+  w.clock += 60_000;
+  w.write(e.episode_id, { claim: d, position: 80_000, generation: gen2 });
+  await a.player.refresh();
+  assert.equal(a.player.state.position, 80_000, "within the new generation, a new write is newer");
+});
+
+// ---- controls never wait for background reads
+
+/** soon fails unless p settles within ms of real time: a control that waits behind a stalled read fails it. */
+async function soon<T>(p: Promise<T>, what: string, ms = 1_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => (timer = setTimeout(() => reject(new Error(`${what} waited for the read`)), ms)));
+  try {
+    return await Promise.race([p, late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** stall holds the next n episode reads (each answered with the server's state when it was asked) until released. */
+function stall(w: World, n = 1) {
+  const read = w.reads.episode;
+  const entered = deferred<void>();
+  const gate = deferred<void>();
+  let calls = 0;
+  let held = 0;
+  w.reads.episode = async (id) => {
+    calls++;
+    if (held >= n) return read(id);
+    held++;
+    const answer = await read(id);
+    entered.resolve();
+    await gate.promise;
+    return answer;
+  };
+  return { entered: entered.promise, release: () => gate.resolve(), calls: () => calls, restore: () => (w.reads.episode = read) };
+}
+
+test("Play, the seeks, Pause and a cut's export act at once while a refresh read is stalled", async () => {
+  const w = await new World().init();
+  const e = w.episode(1, { queued: true });
+  const a = await w.page();
+  await a.player.play(e);
+  await w.listen(a, 10_000);
+  await a.player.pause();
+  const s = stall(w);
+  const refreshing = a.player.refresh();
+  await s.entered;
+  await soon(a.player.play(), "Play");
+  assert.equal(a.media.paused, false);
+  await soon(a.player.seek(120_000), "Seek");
+  assert.equal(a.media.position, 120_000);
+  await soon(a.player.rewind(), "Rewind");
+  assert.equal(a.media.position, 110_000);
+  await soon(a.player.fastForward(), "Fast-forward");
+  assert.equal(a.media.position, 140_000);
+  w.clock += 5_000;
+  a.media.advance(5_000);
+  const deps = await soon(a.player.beforeCut(), "the export before Mark played");
+  assert.ok(deps.includes(of(await w.facts(), "session.checkpoint").at(-1)!.op_id), "the cut depends on the fresh export");
+  await soon(a.player.pause(), "Pause");
+  assert.equal(a.media.paused, true);
+  s.release();
+  await refreshing;
+  wellFormed(await w.facts());
+});
+
+test("Pause resolves at once when nothing plays, even behind a transition waiting on the network", async () => {
+  const w = await new World().init();
+  const e1 = w.episode(1, { queued: true });
+  const e2 = w.episode(2, { queued: true });
+  const a = await w.page();
+  await a.player.play(e1);
+  await a.player.pause();
+  const s = stall(w);
+  const switching = a.player.play(e2);
+  await s.entered;
+  await soon(a.player.pause(), "Pause with nothing playing");
+  s.release();
+  await switching;
+  await a.player.idle();
+  assert.equal(a.media.paused, true);
+});
+
+test("bursts of refreshes make one read in flight, then one more", async () => {
+  const w = await new World().init();
+  const e = w.episode(1, { queued: true });
+  const a = await w.page();
+  await a.player.play(e);
+  await a.player.pause();
+  const s = stall(w);
+  const all = [a.player.refresh()];
+  await s.entered;
+  for (let i = 0; i < 5; i++) all.push(a.player.refresh());
+  assert.equal(s.calls(), 1, "one read in flight");
+  s.release();
+  await Promise.all(all);
+  assert.equal(s.calls(), 2, "then one more for the changes since");
+});
+
+test("a refresh read answered from an older head than the view the player holds is dropped", async () => {
+  const w = await new World().init();
+  const { e, a } = await pausedAfterListening(w);
+  w.clock += 60_000;
+  w.write(e.episode_id, { claim: crypto.randomUUID(), position: 200_000 });
+  await a.player.refresh();
+  w.write(e.episode_id, { claim: crypto.randomUUID(), position: 300_000 });
+  const older = structuredClone({ ...w.views.get(e.episode_id)!, head: w.head });
+  w.write(e.episode_id, { claim: crypto.randomUUID(), position: 100_000 });
+  // A start reads the newest view and adopts it; the audio cannot start, so the player stays paused there.
+  a.media.failPlay = true;
+  await a.player.play();
+  assert.equal(a.player.state.position, 100_000);
+  a.media.failPlay = false;
+  const read = w.reads.episode;
+  w.reads.episode = async () => structuredClone(older); // answered late, from before the newest write
+  await a.player.refresh();
+  w.reads.episode = read;
+  assert.equal(a.player.state.position, 100_000, "the older record never moves the player back");
+});
+
+test("a refresh read begun before a seek made while paused is not applied over it: the episode is read again", async () => {
+  const w = await new World().init();
+  const { e, a } = await pausedAfterListening(w);
+  w.clock += 60_000;
+  const phone = crypto.randomUUID();
+  w.write(e.episode_id, { claim: phone, position: 300_000 });
+  const s = stall(w, 2);
+  const refreshing = a.player.refresh();
+  await s.entered;
+  await a.player.seek(120_000);
+  s.release();
+  // The first answer arrives after the seek: it is read again rather than applied over the seek.
+  await until(() => s.calls() === 2, "the second read");
+  assert.equal(a.player.state.position, 120_000, "the answer read before the seek did not move it");
+  await refreshing;
+  // The second read is decided as any: the phone's write is newer than what the player decided against.
+  assert.equal(a.player.state.position, 300_000);
+});
+
+test("a refresh answer of the lineage the profile has left since its read began is discarded", async () => {
+  const w = await new World().init();
+  const { e, a } = await pausedAfterListening(w);
+  await retire(w.db, w.account, w.head);
+  w.clock += 60_000;
+  w.write(e.episode_id, { claim: crypto.randomUUID(), position: 300_000 });
+  const s = stall(w);
+  const refreshing = a.player.refresh();
+  await s.entered;
+  await w.restore(); // a view of the restored server is shown meanwhile
+  s.release();
+  await refreshing;
+  assert.equal(a.player.state.position, 20_000);
+  assert.equal(superseded(await w.facts()).length, 0);
+  await a.player.play(); // nothing newer is known: the paused session resumes where it was
+  assert.ok(a.media.position <= 20_000 && a.media.position >= 17_000, `${a.media.position}`);
+  await a.player.pause();
+});
+
+test("a refresh read that completes while a start prepares its media is used at READY, even when the start cannot read", async () => {
+  const w = await new World().init();
+  const e = w.episode(1, { queued: true, position: 100_000, claim: crypto.randomUUID() });
+  const phone = crypto.randomUUID();
+  let a!: Awaited<ReturnType<World["page"]>>;
+  const media = new FakeMedia();
+  const load = media.load.bind(media);
+  media.load = async (url, position) => {
+    await load(url, position);
+    w.write(e.episode_id, { claim: phone, position: 300_000 });
+    void a.player.refresh(); // its application waits behind this start
+    await until(() => a.player.unappliedRead?.seq === w.head.seq, "the refresh answer"); // the answer is in
+    w.offline = true; // the start's own read fails
+  };
+  a = await w.page("a", media);
+  await a.player.play(e);
+  w.offline = false;
+  const start = of(await w.facts(), "session.start")[0]!;
+  assert.deepEqual([p(start).start_position, p(start).observed_claim], [300_000, phone]);
+  await a.player.idle();
+  assert.equal(a.media.position, 300_000, "the late application never moves the playing audio");
+});
+
+test("a refresh read across a lost and regained lease is not applied over what happened since", async () => {
+  const w = await new World().init();
+  const { e, a } = await pausedAfterListening(w);
+  w.clock += 60_000;
+  w.write(e.episode_id, { claim: crypto.randomUUID(), position: 300_000 });
+  const s = stall(w);
+  const refreshing = a.player.refresh();
+  await s.entered;
+  // Another tab takes the player, plays from the phone's position and pauses; this tab takes it back.
+  const b = await w.page();
+  await b.player.moveHere();
+  await a.player.leaseTick(); // this tab finds the player taken
+  assert.equal(a.player.state.mode, "elsewhere");
+  await w.listen(b, 5_000);
+  await b.player.pause();
+  await a.player.moveHere();
+  await b.player.idle();
+  const at = a.media.position;
+  s.release();
+  await refreshing;
+  await a.player.idle();
+  assert.equal(a.player.state.playing, true);
+  assert.equal(a.media.position, at, "the old answer moved nothing");
+  assert.ok(at >= 300_000 + 4_000, `it plays on from where the other tab paused (${at})`);
+  await a.player.pause();
+  wellFormed(await w.facts());
+});
+
+// ---- seeks chosen while paused, READY after the queue, fenced first reads, sessions read by episode
+
+/** until waits for a condition, turn by turn, and fails if it never holds. */
+async function until(check: () => boolean | Promise<boolean>, what = "the condition"): Promise<void> {
+  for (let i = 0; i < 2_000; i++) {
+    if (await check()) return;
+    await new Promise((r) => setImmediate(r));
+  }
+  throw new Error(`${what} never held`);
+}
+
+test("a seek made while paused after another device's position was known is where Play starts, also after a reload", async () => {
+  for (const variant of ["seek", "seek, then a reload", "no seek"] as const) {
+    const w = await new World().init();
+    const e = w.episode(1, { queued: true });
+    let a = await w.page("tab");
+    await a.player.play(e);
+    await w.listen(a, 10_000);
+    await w.acknowledgeAll();
+    const phone = crypto.randomUUID();
+    w.write(e.episode_id, { claim: phone, position: 300_000 });
+    await a.player.refresh(); // known while playing: the audio is not moved
+    await a.player.pause();
+    if (variant !== "no seek") await a.player.seek(120_000); // chosen after the phone's position was known
+    if (variant === "seek, then a reload") {
+      a.player.dispose();
+      a = await w.page("tab");
+      assert.equal(a.player.state.position, 120_000, variant);
+    }
+    w.clock += 1_000;
+    await a.player.play();
+    if (variant === "no seek") {
+      // Pause, then Play with nothing chosen since: the phone's newer position is where it starts.
+      assert.equal(a.media.position, 300_000 - 800, variant);
+      continue;
+    }
+    assert.ok(a.media.position <= 120_000 && a.media.position >= 117_000, `${variant}: ${a.media.position}`);
+    await w.listen(a, 5_000);
+    await a.player.pause();
+    const facts = await w.facts();
+    if (variant === "seek") {
+      // Play claims the chosen position over the phone's, which it observed.
+      const start = of(facts, "session.start").at(-1)!;
+      assert.deepEqual([p(start).start_position, p(start).observed_claim], [120_000 - 800, phone], variant);
+    }
+    assert.ok(p(of(facts, "session.checkpoint").at(-1)!).position >= 120_000, variant);
+    wellFormed(facts);
+  }
+});
+
+test("a refresh answer that arrives while a start waits for the queue is used at READY", async () => {
+  const w = await new World().init();
+  w.episode(1, { queued: true });
+  const e = w.episode(3, { position: 100_000, claim: crypto.randomUUID() }); // not queued: its play adds it
+  const a = await w.page();
+  const queue = w.reads.queue;
+  const asked = deferred<void>();
+  const gate = deferred<void>();
+  w.reads.queue = async () => {
+    asked.resolve();
+    await gate.promise;
+    return queue();
+  };
+  const playing = a.player.play(e);
+  await asked.promise; // both episode reads are done; the queue is slow
+  const phone = crypto.randomUUID();
+  w.write(e.episode_id, { claim: phone, position: 300_000 });
+  void a.player.refresh(); // its application waits behind the start
+  await until(() => a.player.unappliedRead?.seq === w.head.seq, "the refresh answer");
+  gate.resolve();
+  await playing;
+  const start = of(await w.facts(), "session.start")[0]!;
+  assert.deepEqual([p(start).start_position, p(start).observed_claim], [300_000, phone]);
+  assert.ok(p(start).queue_bundle, "it is still added to the queue");
+  assert.ok(start.dependencies.includes(phone), "it depends on the record it observed");
+});
+
+test("an initial read answered before the server's restore never chooses where a new play starts", async () => {
+  const w = await new World().init();
+  await updateInstallation(w.db, w.account, (r) => (r.lineage = { log_id: w.head.log_id, epoch: w.head.epoch }));
+  const e = w.episode(1, { queued: true, position: 100_000, claim: crypto.randomUUID() });
+  w.views.get(e.episode_id)!.episode.last_played = w.clock - 1_000;
+  const a = await w.page();
+  const read = w.reads.episode;
+  const asked = deferred<void>();
+  const gate = deferred<void>();
+  let first = true;
+  w.reads.episode = async (id) => {
+    if (!first) return read(id);
+    first = false;
+    const old = await read(id); // answered from before the restore
+    asked.resolve();
+    await gate.promise;
+    return old;
+  };
+  const playing = a.player.play(e);
+  await asked.promise;
+  // The server is restored (epoch 2, accepted; epoch 1 retired): there the episode stands at 5:00 under another claim, listened a second earlier.
+  await w.restore();
+  const restored = crypto.randomUUID();
+  w.write(e.episode_id, { claim: restored, position: 300_000, lastPlayed: w.clock - 2_000 });
+  gate.resolve();
+  await playing;
+  const start = of(await w.facts(), "session.start")[0]!;
+  assert.deepEqual([p(start).start_position, p(start).observed_claim], [300_000 - 800, restored]);
+});
+
+test("a start never falls back to a view of the lineage the profile left: it records nothing and says so", async () => {
+  const w = await new World().init();
+  const e = w.episode(1, { queued: true, position: 100_000, claim: crypto.randomUUID() });
+  const a = await w.page();
+  const left = w.head;
+  await w.restore(); // epoch 2 is the profile's; every answer below is still epoch 1's
+  w.reads.episode = async (id) => structuredClone({ ...w.views.get(id)!, head: left });
+  await a.player.play(e);
+  assert.equal(of(await w.facts(), "session.start").length, 0, "no claim built on a view the gate dropped");
+  assert.deepEqual(a.notices, ["unreachable"]);
+});
+
+test("deciding on an episode's record reads that episode's sessions only, however long the profile's history", async () => {
+  const w = await new World().init();
+  const { e, a } = await pausedAfterListening(w);
+  w.clock += 60_000;
+  w.write(e.episode_id, { claim: crypto.randomUUID(), position: 300_000 });
+  await a.player.refresh();
+  let rows = 0;
+  const count = (r: IDBRequest, n: (v: unknown) => number) => r.addEventListener("success", () => (rows += n(r.result)));
+  const storeGetAll = IDBObjectStore.prototype.getAll;
+  const storeGet = IDBObjectStore.prototype.get;
+  const indexGetAll = IDBIndex.prototype.getAll;
+  IDBObjectStore.prototype.getAll = function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore["getAll"]>) {
+    const r = storeGetAll.apply(this, args);
+    if (this.name === "sessions") count(r, (v) => (v as unknown[]).length);
+    return r;
+  };
+  IDBObjectStore.prototype.get = function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore["get"]>) {
+    const r = storeGet.apply(this, args);
+    if (this.name === "sessions") count(r, (v) => (v ? 1 : 0));
+    return r;
+  };
+  IDBIndex.prototype.getAll = function (this: IDBIndex, ...args: Parameters<IDBIndex["getAll"]>) {
+    const r = indexGetAll.apply(this, args);
+    if (this.objectStore.name === "sessions") count(r, (v) => (v as unknown[]).length);
+    return r;
+  };
+  const measure = async (step: () => Promise<unknown>) => {
+    rows = 0;
+    await step();
+    return rows;
+  };
+  let moves = 0;
+  const steps = async () => [
+    await measure(() => a.player.refresh()), // an unchanged record
+    await measure(async () => {
+      w.write(e.episode_id, { claim: crypto.randomUUID(), position: 200_000 + 1_000 * ++moves });
+      await a.player.refresh(); // a changed one, adopted
+    }),
+  ];
+  try {
+    const before = await steps();
+    // Years of listening to other episodes in this profile.
+    const [template] = await sessionsOf(w.db, w.account);
+    await inPlayer(w.db, async (t) => {
+      for (let i = 0; i < 5_000; i++) {
+        const other = `e1:${String(1_000 + i).padStart(64, "0")}`;
+        await new Promise((r) => (t.objectStore("sessions").put({ ...template!, session_id: crypto.randomUUID(), episode: { ...template!.episode, episode_id: other }, sealed: "switched", closed: true }).onsuccess = r));
+      }
+    });
+    const after = await steps();
+    assert.deepEqual(after, before, "the same rows, with 5,000 unrelated sessions");
+    w.clock += 1_000;
+    const ready = await measure(() => a.player.play());
+    assert.ok(ready <= 6, `READY reads this episode's sessions only (${ready} rows)`);
+  } finally {
+    IDBObjectStore.prototype.getAll = storeGetAll;
+    IDBObjectStore.prototype.get = storeGet;
+    IDBIndex.prototype.getAll = indexGetAll;
+  }
+});
+
+test("a profile saved before the episode index keeps its sessions: the upgrade indexes them", async () => {
+  // The database as the previous version left it: the sessions store without its episode index.
+  const name = `player-upgrade-${++dbn}`;
+  const account = crypto.randomUUID();
+  const old: IDBDatabase = await new Promise((resolve, reject) => {
+    const q = indexedDB.open(name, 2);
+    q.onupgradeneeded = () => {
+      const db = q.result;
+      db.createObjectStore("installations", { keyPath: "account_id" });
+      db.createObjectStore("authors", { keyPath: "author_id" }).createIndex("account", "account_id");
+      db.createObjectStore("journal", { keyPath: ["account_id", "install_seq"] }).createIndex("op", ["account_id", "op_id"]);
+      db.createObjectStore("sessions", { keyPath: ["account_id", "session_id"] });
+      db.createObjectStore("leases", { keyPath: "account_id" });
+      db.createObjectStore("retained", { keyPath: ["account_id", "install_id", "install_seq"] });
+    };
+    q.onsuccess = () => resolve(q.result);
+    q.onerror = () => reject(q.error);
+  });
+  const episode = (n: number) => ({ episode_id: `e1:${String(n).padStart(64, "0")}`, podcast_id: podcast, generation_id: gen, occurrence: {} });
+  await new Promise<void>((resolve) => {
+    const t = old.transaction("sessions", "readwrite");
+    for (const n of [1, 1, 2]) t.objectStore("sessions").put({ account_id: account, session_id: crypto.randomUUID(), episode: episode(n) });
+    t.oncomplete = () => resolve();
+  });
+  old.close();
+  const db = await openDB(indexedDB, name);
+  assert.equal((await sessionsOfEpisode(db, account, episode(1).episode_id)).length, 2);
+  assert.equal((await sessionsOfEpisode(db, account, episode(2).episode_id)).length, 1);
+  assert.equal((await sessionsOf(db, account)).length, 3, "nothing lost");
+  db.close();
+});
+
+// ---- starting an episode: one read of it, the queue add's reads beside the media, READY's bounded wait
+
+/** gated gives a page media whose load waits until released; loading resolves when a load begins. */
+function gated() {
+  const media = new FakeMedia();
+  const load = media.load.bind(media);
+  const loading = deferred<void>();
+  const gate = deferred<void>();
+  let held = true;
+  media.load = async (url, position) => {
+    if (held) {
+      held = false;
+      loading.resolve();
+      await gate.promise;
+    }
+    await load(url, position);
+  };
+  return { media, loading: loading.promise, release: () => gate.resolve() };
+}
+
+/** logged records the reads a page's player asks for, in order, with the media's starts. */
+function logged(w: World, media: FakeMedia): string[] {
+  const log: string[] = [];
+  const { episode, queue, summary } = w.reads;
+  w.reads.episode = (id) => (log.push(`episode ${id.slice(-1)}`), episode(id));
+  w.reads.queue = () => (log.push("queue"), queue());
+  w.reads.summary = () => (log.push("summary"), summary());
+  const play = media.play.bind(media);
+  media.play = () => (log.push("play"), play());
+  return log;
+}
+
+test("a new unqueued episode starts after one read of it, with the queue and summary read while its media prepares; a queued one reads neither", async () => {
+  const w = await new World().init();
+  w.episode(9, { queued: true });
+  const e1 = w.episode(1);
+  const e2 = w.episode(2, { queued: true });
+  const g = gated();
+  const a = await w.page("a", g.media);
+  const log = logged(w, g.media);
+  const playing = a.player.play(e1);
+  await g.loading;
+  await until(() => log.includes("queue") && log.includes("summary"), "the queue add's reads, while the media prepares");
+  assert.deepEqual(log, ["episode 1", "queue", "summary"]);
+  g.release();
+  await playing;
+  assert.deepEqual(log, ["episode 1", "queue", "summary", "play"], "no second read of the episode before it plays");
+  const start = of(await w.facts(), "session.start")[0]!;
+  assert.ok(p(start).queue_bundle, "playing it adds it to the queue");
+  await a.player.idle();
+  // A queued episode has no queue add: neither read is asked before it plays.
+  log.length = 0;
+  await a.player.play(e2);
+  assert.deepEqual(log.slice(0, log.indexOf("play") + 1), ["episode 2", "play"]);
+  assert.equal(of(await w.facts(), "session.start").length, 2);
+});
+
+test("a change announced while the media prepares is waited for at READY: an answer that comes within the bound is where Play starts", async () => {
+  const w = await new World().init();
+  const e = w.episode(1, { queued: true, position: 100_000, claim: crypto.randomUUID() });
+  const phone = crypto.randomUUID();
+  const g = gated();
+  const a = await w.page("a", g.media, { readyWaitMs: 60_000 });
+  const playing = a.player.play(e);
+  await g.loading;
+  w.write(e.episode_id, { claim: phone, position: 300_000 });
+  const s = stall(w);
+  void a.player.refresh(); // the event stream announces the phone's write; its read is slow
+  await s.entered;
+  g.release();
+  await until(() => g.media.url !== null, "the media prepared");
+  for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r)); // READY is waiting for the refresh's read
+  assert.equal(of(await w.facts(), "session.start").length, 0, "READY waits for the announced change");
+  s.release();
+  await playing;
+  const start = of(await w.facts(), "session.start")[0]!;
+  assert.deepEqual([p(start).start_position, p(start).observed_claim], [300_000, phone]);
+  assert.equal(s.calls(), 1, "READY waited for the refresh's own read, and asked none");
+  await a.player.idle();
+});
+
+test("a stalled read of an announced change holds READY at most its bound: Play starts from the view it holds", async () => {
+  const w = await new World().init();
+  const held = crypto.randomUUID();
+  const e = w.episode(1, { queued: true, position: 100_000, claim: held });
+  let a!: Awaited<ReturnType<World["page"]>>;
+  let s!: ReturnType<typeof stall>;
+  a = await w.page("a", preparing(() => {
+    w.write(e.episode_id, { claim: crypto.randomUUID(), position: 300_000 });
+    s = stall(w, 2);
+    void a.player.refresh();
+  }), { readyWaitMs: 200 });
+  const began = Date.now();
+  await soon(a.player.play(e), "Play with the read stalled", 5_000);
+  assert.ok(Date.now() - began >= 150, "READY waited for the read");
+  const start = of(await w.facts(), "session.start")[0]!;
+  assert.deepEqual([p(start).start_position, p(start).observed_claim], [100_000, held], "the view it held");
+  assert.equal(a.media.paused, false);
+  s.release();
+  await a.player.idle();
+  assert.equal(a.media.position, 100_000, "the late answer never moves the playing audio");
+});
+
+test("a read of an announced change that fails does not hold READY: Play starts from the view it holds", async () => {
+  const w = await new World().init();
+  const held = crypto.randomUUID();
+  const e = w.episode(1, { queued: true, position: 100_000, claim: held });
+  let a!: Awaited<ReturnType<World["page"]>>;
+  a = await w.page("a", preparing(() => {
+    w.offline = true; // the refresh's read and READY's own both fail
+    void a.player.refresh();
+  }), { readyWaitMs: 60_000 });
+  await soon(a.player.play(e), "Play after the read failed", 5_000);
+  w.offline = false;
+  const start = of(await w.facts(), "session.start")[0]!;
+  assert.deepEqual([p(start).start_position, p(start).observed_claim], [100_000, held]);
+  await a.player.idle();
+});
+
+test("READY never takes or waits for a read of the episode played before: it reads the new one", async () => {
+  const w = await new World().init();
+  const e1 = w.episode(1, { queued: true });
+  const e2 = w.episode(2, { queued: true, position: 100_000, claim: crypto.randomUUID() });
+  const phone = crypto.randomUUID();
+  const a = await w.page("a", new FakeMedia(), { readyWaitMs: 60_000 });
+  await a.player.play(e1);
+  await w.listen(a, 5_000);
+  await a.player.pause();
+  // Episode 2 is played. While its read is answered, a change is announced (the phone's write of
+  // episode 2): the background refresh still reads episode 1, the current one, and that read stalls.
+  const read = w.reads.episode;
+  const switching = deferred<void>();
+  const answered = deferred<void>();
+  const stalled = deferred<void>();
+  const gate = deferred<void>();
+  w.reads.episode = async (id) => {
+    const answer = await read(id);
+    if (id === e2.episode_id) {
+      w.reads.episode = async (id2) => {
+        const later = await read(id2);
+        if (id2 === e1.episode_id) {
+          stalled.resolve();
+          await gate.promise;
+        }
+        return later;
+      };
+      switching.resolve();
+      await answered.promise;
+    }
+    return answer;
+  };
+  const playing = a.player.play(e2);
+  await switching.promise;
+  w.write(e2.episode_id, { claim: phone, position: 300_000 });
+  const refreshing = a.player.refresh();
+  await stalled.promise; // episode 1's read, asked after the announcement
+  answered.resolve();
+  await soon(playing, "Play while episode 1's read is stalled", 5_000);
+  const start = of(await w.facts(), "session.start").at(-1)!;
+  assert.equal(p(start).episode.episode_id, e2.episode_id);
+  assert.deepEqual([p(start).start_position, p(start).observed_claim], [300_000, phone]);
+  gate.resolve();
+  await refreshing;
+  await a.player.idle();
+  assert.equal(a.player.state.episode?.episode_id, e2.episode_id);
+  assert.ok(a.media.position >= 300_000, "episode 1's answer moved nothing");
+  await a.player.pause();
+  wellFormed(await w.facts());
+});
+
+test("a change READY could not wait for is still read after the start", async () => {
+  const w = await new World().init();
+  const e1 = w.episode(1, { queued: true });
+  const held = crypto.randomUUID();
+  const e2 = w.episode(2, { queued: true, position: 100_000, claim: held });
+  const phone = crypto.randomUUID();
+  const a = await w.page("a", new FakeMedia(), { readyWaitMs: 100 });
+  await a.player.play(e1);
+  await w.listen(a, 5_000);
+  await a.player.pause();
+  // Episode 2 is played. While its read is answered, the phone's write of it is announced, and the
+  // background refresh reads episode 1, still the current one; READY's own read of episode 2 is slow.
+  const read = w.reads.episode;
+  const answered = deferred<void>();
+  const switching = deferred<void>();
+  const slow = deferred<void>();
+  let reads2 = 0;
+  w.reads.episode = async (id) => {
+    const answer = await read(id);
+    if (id === e2.episode_id && ++reads2 === 1) {
+      switching.resolve();
+      await answered.promise;
+    } else if (id === e2.episode_id && reads2 === 2) await slow.promise;
+    return answer;
+  };
+  const playing = a.player.play(e2);
+  await switching.promise;
+  w.write(e2.episode_id, { claim: phone, position: 300_000 });
+  void a.player.refresh();
+  await until(() => a.player.unappliedRead !== null, "the refresh's answer, of episode 1");
+  answered.resolve();
+  await soon(playing, "Play while READY's read is slow", 5_000);
+  const start = of(await w.facts(), "session.start").at(-1)!;
+  assert.deepEqual([p(start).start_position, p(start).observed_claim], [100_000, held], "it started from the view it held");
+  await a.player.idle();
+  // The answer READY could not wait for is not lost: the episode is read again once it plays (whose
+  // answer sync never applies to the playing audio, but keeps for an intentional seek).
+  assert.equal(reads2, 3, "the switch's read, READY's own, and one more after the start");
+  assert.equal(a.media.position, 100_000);
+  slow.resolve();
+  await a.player.pause();
+  wellFormed(await w.facts());
+});
+
+test("a background read of the episode that fails is tried again with backoff until the player shows the newest head", async () => {
+  // The tab's heads and visibility, and the player following them (instance.ts), on the real engine.
+  const saved = (globalThis as Record<string, unknown>).BroadcastChannel;
+  (globalThis as Record<string, unknown>).BroadcastChannel = undefined;
+  const { followHeads } = await import("../src/player/instance.ts");
+  const { Value } = await import("../src/util/value.ts");
+  (globalThis as Record<string, unknown>).BroadcastChannel = saved;
+  const w = await new World().init();
+  const e = w.episode(1, { queued: true });
+  const a = await w.page();
+  await a.player.play(e);
+  await w.listen(a, 10_000);
+  await a.player.pause();
+  await w.acknowledgeAll();
+  await a.player.refresh();
+  assert.deepEqual(a.player.viewHead?.seq, w.head.seq);
+  // Another device moves the position: the head moves on twice.
+  w.write(e.episode_id, { claim: crypto.randomUUID(), position: 300_000, lastPlayed: w.clock - 10_000 });
+  w.write(e.episode_id, { claim: crypto.randomUUID(), position: 400_000, lastPlayed: w.clock - 5_000 });
+  // The first read of the episode fails (a dropped connection); later ones answer.
+  let reads = 0;
+  const episode = w.reads.episode;
+  w.reads.episode = async (id: string) => {
+    if (++reads === 1) throw new Error("unreachable");
+    return episode(id);
+  };
+  const timers: { fn: () => void; ms: number }[] = [];
+  const sync = { known: new Value<{ log_id: string; epoch: number; seq: number } | null>(null), revalidate: new Value(0), visible: new Value(true) };
+  const off = followHeads(sync as never, a.player, { setTimeout: (fn, ms) => timers.push({ fn, ms }), clearTimeout: () => {} });
+  sync.known.set({ log_id: w.head.log_id, epoch: w.head.epoch, seq: w.head.seq });
+  for (let i = 0; i < 50 && !timers.length; i++) await new Promise((r) => setImmediate(r));
+  await a.player.idle();
+  assert.equal(reads, 1);
+  assert.deepEqual(timers.map((t) => t.ms), [2000], "tried again after 2 s");
+  timers[0]!.fn();
+  for (let i = 0; i < 50 && a.player.viewHead?.seq !== w.head.seq; i++) await new Promise((r) => setImmediate(r));
+  await a.player.idle();
+  assert.equal(reads, 2);
+  assert.equal(a.player.viewHead?.seq, w.head.seq, "the newest head");
+  assert.equal(a.player.state.position, 400_000, "the paused player shows the other device's position");
+  assert.equal(timers.length, 1, "no more tries once it succeeded");
+  off();
+  w.reads.episode = episode;
 });

@@ -1,7 +1,9 @@
 // The server's import report (PROTOCOL §11.5): what was imported, and every podcast or
-// episode skipped, merged or left unmatched, with its reason.
+// episode skipped, merged or left unmatched, with its reason; then what stays on the
+// device the backup came from (its podcast settings and episodes kept from automatic download).
 import { w } from "../i18n.ts";
 import { web, type WebKey } from "../webStrings.ts";
+import { notCarriedText, type NotCarried } from "./importText.ts";
 
 interface Entry {
   kind?: string;
@@ -15,6 +17,7 @@ export interface ImportResult {
   skipped: Entry[] | null;
   ambiguous: Entry[] | null;
   merged: Entry[] | null;
+  not_carried?: NotCarried; // an older server's report has none
 }
 
 export interface ImportStatus {
@@ -29,6 +32,37 @@ export interface ImportStatus {
 function reason(r: string): string {
   const key = `import_reason_${r}`;
   return key in web ? w(key as WebKey) : r.replace(/_/g, " ");
+}
+
+function NotCarriedSection({ nc }: { nc: NotCarried | undefined }) {
+  const text = notCarriedText(nc);
+  if (!text) return null;
+  return (
+    <>
+      {text.podcasts.length > 0 && (
+        <details class="import-entries">
+          <summary>
+            {w("import_not_carried_settings")} ({text.podcasts.length})
+          </summary>
+          <p class="secondary">{w("import_not_carried_settings_note")}</p>
+          <ul>
+            {text.podcasts.map((p, i) => (
+              <li key={i} dir="auto">
+                <bdi>{p.title}</bdi>
+                {p.address && (
+                  <>
+                    {" "}(<bdi>{p.address}</bdi>)
+                  </>
+                )}
+                : {p.settings}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+      {text.episodes && <p>{text.episodes}</p>}
+    </>
+  );
 }
 
 function Entries({ title, entries }: { title: WebKey; entries: Entry[] | null | undefined }) {
@@ -79,6 +113,7 @@ export function ImportReport({ status }: { status: ImportStatus }) {
           <Entries title="import_skipped" entries={r.skipped} />
           <Entries title="import_merged" entries={r.merged} />
           <Entries title="import_ambiguous" entries={r.ambiguous} />
+          <NotCarriedSection nc={r.not_carried} />
         </>
       )}
     </div>

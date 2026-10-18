@@ -1,47 +1,44 @@
 // The tab's sync loop (PROTOCOL §12): actions are journaled
 // first and pushed in the background; every view shown advances the cursor
-// pushes name and retires what it shows; the event stream, reconnects and
-// focus make visible views re-read. With the server unreachable, one banner
-// says so and controls wait.
+// pushes name and retires what it shows. The heads the server announces (push
+// responses, the event stream, views applied) make displayed views re-read
+// once per newer head; reconnects, focus, online, a recovery and a successor
+// make them revalidate. With the server unreachable, one banner says so and
+// controls wait.
 import { ApiError, get, post, refused, Unreachable } from "../api/http.ts";
-import type { Head } from "../api/views.ts";
+import type { Counters, Head } from "../api/views.ts";
 import type { EntryRow, Receipt } from "../journal/db.ts";
-import { append, entries, installation, outcomeShown, retire, updateInstallation, type FactBody } from "../journal/journal.ts";
-import { pushAll, type PushResponse } from "../journal/pusher.ts";
-import { retainedEntries, takeSuccessor } from "../journal/successor.ts";
+import { append, appendAll, entries, installation, lineages, outcomeShown, retire, retireLineage, staleLineage, updateInstallation, type FactBody, type Lineages } from "../journal/journal.ts";
+import { decodeCursor, pushAll, type PushResponse } from "../journal/pusher.ts";
+import { planSuccessor, retainedEntries, SuccessorBusy, takeSuccessor } from "../journal/successor.ts";
 import { recover, type RecoveryState, type RecoveryTransport } from "../journal/recovery.ts";
 import { appVersion, browserName, capabilities, type Session } from "./boot.ts";
 import { reads } from "../api/views.ts";
+import { sameLineage, type HeadLike } from "./heads.ts";
 
-type Listener = () => void;
+import { Value } from "../util/value.ts";
 
-/** A tiny observable value. */
-export class Value<T> {
-  #v: T;
-  #ls = new Set<Listener>();
-  constructor(v: T) {
-    this.#v = v;
-  }
-  get(): T {
-    return this.#v;
-  }
-  set(v: T): void {
-    if (Object.is(v, this.#v)) return;
-    this.#v = v;
-    for (const l of [...this.#ls]) l();
-  }
-  subscribe(l: Listener): () => void {
-    this.#ls.add(l);
-    return () => this.#ls.delete(l);
-  }
-}
+export { Value };
 
 export type Connection = "online" | "unreachable";
 
 export interface Notice {
   id: number;
   text: string;
-  action?: { label: string; run: () => void };
+  /** action is the notice's button (Undo); a failure of what it starts is shown as any action's is (progress.track). */
+  action?: { label: string; run: () => void | Promise<void> };
+}
+
+/**
+ * registeredAlready settles a refused successor registration: when the
+ * browser's credential already is that successor (an earlier answer reached
+ * the browser, and its tab closed before finishing), the server refuses the
+ * repeat as a request for its own ID, and the handoff finishes here without
+ * registering again. Anything else is the refusal it is.
+ */
+async function registeredAlready(e: unknown, installId: string): Promise<void> {
+  if (e instanceof ApiError && e.status === 400 && (await get<{ install_id: string | null }>("/v1/session")).install_id === installId) return;
+  throw e;
 }
 
 export class Sync {
@@ -52,11 +49,23 @@ export class Sync {
   readonly paused = new Value<string | null>(null);
   /** refused is the server's message when it refuses this browser's push as invalid; it is retried, and shown until a push succeeds. */
   readonly refused = new Value<string | null>(null);
+  /** unsendable is whether an unsent change is too large for the server and cannot be split: it and the changes after it are kept, unsent. */
+  readonly unsendable = new Value(false);
   /** recovery is how far this browser's recovery after a restore has come (null: none running). */
   readonly recovery = new Value<RecoveryState | null>(null);
   readonly notices = new Value<Notice[]>([]);
-  /** changed bumps when visible views should re-read. */
-  readonly changed = new Value(0);
+  /**
+   * known is the newest head the tab knows the server has: from push
+   * responses, the event stream and the views applied. It only moves forward
+   * within a lineage, and never to a lineage the profile has left.
+   */
+  readonly known = new Value<HeadLike | null>(null);
+  /** revalidate bumps when displayed views should read again whatever the heads (a reconnect, focus, online, a recovery, a successor). */
+  readonly revalidate = new Value(0);
+  /** visible is whether the tab is shown: a hidden tab's views wait, and read once when it shows again. */
+  readonly visible = new Value(typeof document === "undefined" || document.visibilityState !== "hidden");
+  /** counters are the drawer's counters, from the newest view applied (never an older one of its lineage). */
+  readonly counters = new Value<{ head: HeadLike; counters: Counters } | null>(null);
   #shown: Head | undefined;
   #timer: ReturnType<typeof setTimeout> | undefined;
   #running = false;
@@ -89,6 +98,14 @@ export class Sync {
     this.pending.set(this.pending.get() + 1);
     this.schedule(0);
     return entry;
+  }
+
+  /** actAll journals an action made of several facts (actions.chunks), all in one transaction; it is done once this resolves. */
+  async actAll(bodies: FactBody[]): Promise<EntryRow[]> {
+    const entries = await appendAll(this.session.db, this.account, this.session.author.author_id, bodies);
+    this.pending.set(this.pending.get() + entries.length);
+    this.schedule(0);
+    return entries;
   }
 
   /**
@@ -153,30 +170,125 @@ export class Sync {
     }
   }
 
-  /** shown records the head of a view the tab displayed: pushes name it, and it retires what it shows (PROTOCOL §12). */
+  /**
+   * shown records the head of a view the tab displayed: pushes name it, and it
+   * retires what it shows (PROTOCOL §12). The profile's lineage only moves
+   * forward: a late view of a lineage it has left (an older epoch, a retired
+   * log) changes nothing.
+   */
   async shown(head: Head): Promise<void> {
     const s = this.#shown;
     if (s && s.log_id === head.log_id && s.epoch === head.epoch && s.seq >= head.seq) return;
     this.#shown = head;
     let restored = false;
+    let stale = false;
+    let from = "";
     await updateInstallation(this.session.db, this.account, (r) => {
+      if (staleLineage(r, head)) {
+        stale = true;
+        return;
+      }
       // Another lineage than the one this browser's receipts came from: the
-      // server was restored. Its facts continue under a successor (PROTOCOL §12).
+      // server was restored. Its facts continue under a successor (PROTOCOL §12),
+      // after what it had acknowledged is recovered (§6.11). Both are planned in
+      // this transaction, with the new lineage, so whichever tab or load comes
+      // next finishes them.
       restored = !!r.lineage && (r.lineage.log_id !== head.log_id || r.lineage.epoch !== head.epoch);
-      r.lineage = { log_id: head.log_id, epoch: head.epoch };
+      retireLineage(r, head);
       r.cursor = head.cursor;
+      if (restored) planSuccessor(r, { freshNonce: false, recovery: true, head: { cursor: head.cursor, log_id: head.log_id, epoch: head.epoch } });
+      from = r.install_id;
     });
-    if (restored) await this.successor(false, head);
+    if (stale) {
+      if (this.#shown === head) this.#shown = s;
+      return;
+    }
+    if (restored) await this.successor(false, head, from);
     await retire(this.session.db, this.account, head);
     this.schedule(0);
   }
 
-  /** successor continues this browser's writes under a new installation (PROTOCOL §12). */
-  async successor(freshNonce: boolean, head?: Head): Promise<void> {
+  /**
+   * accepts tells whether a view's head may be shown: not of a lineage the
+   * profile has left, and not a late answer of the profile's lineage once the
+   * server has announced another (a restore the tab has not shown yet).
+   */
+  async accepts(head: HeadLike): Promise<boolean> {
+    return this.#accepts(await lineages(this.session.db, this.account), head);
+  }
+
+  #accepts(l: Lineages, head: HeadLike): boolean {
+    if (staleLineage(l, head)) return false;
+    const k = this.known.get();
+    return !(k && !sameLineage(k, head) && l.lineage && sameLineage(head, l.lineage) && !staleLineage(l, k));
+  }
+
+  /** learn takes a head the server announced: displayed views re-read once if it is newer than theirs. */
+  async learn(head: HeadLike): Promise<void> {
+    const l = await lineages(this.session.db, this.account);
+    if (this.#accepts(l, head)) this.#advance(head);
+  }
+
+  #advance(head: HeadLike): void {
+    const k = this.known.get();
+    if (k && sameLineage(k, head) && head.seq <= k.seq) return;
+    this.known.set({ log_id: head.log_id, epoch: head.epoch, seq: head.seq });
+  }
+
+  /**
+   * applied records a view the tab applied (its head accepted): the known
+   * head, the drawer's counters when newer, and, unless `display` is false,
+   * the head shown (the push cursor and retirement).
+   */
+  applied(head: Head, counters?: Counters, display = true): void {
+    this.#advance(head);
+    const c = this.counters.get();
+    if (counters && (!c || !sameLineage(c.head, head) || head.seq > c.head.seq)) {
+      this.counters.set({ head: { log_id: head.log_id, epoch: head.epoch, seq: head.seq }, counters });
+    }
+    if (display) void this.shown(head);
+  }
+
+  /**
+   * heard takes the event stream's `changed` data, the server's head
+   * (PROTOCOL §12): views not at it re-read once; data that is not a head
+   * makes them revalidate.
+   */
+  heard(data: string): void {
+    let head: HeadLike | null = null;
+    try {
+      const v = JSON.parse(data) as Record<string, unknown>;
+      if (typeof v.log_id === "string" && Number.isSafeInteger(v.epoch) && Number.isSafeInteger(v.seq)) head = { log_id: v.log_id, epoch: v.epoch as number, seq: v.seq as number };
+    } catch {
+      /* not a head */
+    }
+    if (head) void this.learn(head).catch((e: unknown) => console.error("sync: learn", e));
+    else this.#revalidate();
+  }
+
+  #revalidate(): void {
+    this.revalidate.set(this.revalidate.get() + 1);
+  }
+
+  /**
+   * successor continues this browser's writes under a new installation (PROTOCOL §12).
+   * `from` is the installation it replaces: if another tab replaced that one
+   * meanwhile, nothing more is taken, and this tab finishes what is missing.
+   * False while another tab registers it: the push loop asks again later.
+   */
+  async successor(freshNonce: boolean, head: Head | undefined, from: string): Promise<boolean> {
     // After a restore (not a copied profile), what this browser had acknowledged is
     // recovered before its later writes go out; the recovery is recorded with the
     // successor's plan, in one transaction (PROTOCOL §6.11).
-    await this.#handoff(freshNonce, head, !freshNonce);
+    try {
+      await this.#handoff(freshNonce, head, !freshNonce, from);
+    } catch (e) {
+      if (!(e instanceof SuccessorBusy)) throw e;
+      this.#retryLater();
+      return false;
+    }
+    this.#revalidate();
+    return true;
   }
 
   /**
@@ -184,17 +296,35 @@ export class Sync {
    * planned and could not register (its request lost, the tab closed): the
    * plan's IDs are reused, so the request is the same.
    */
-  async #handoff(freshNonce: boolean, head?: Head, recovery = false): Promise<void> {
-    await takeSuccessor(this.session.db, this.account, (body) => post("/v1/installations/successor", body), {
+  async #handoff(freshNonce: boolean, head: Head | undefined, recovery: boolean, from: string): Promise<void> {
+    await takeSuccessor(this.session.db, this.account, (body) => post("/v1/installations/successor", body).catch((e: unknown) => registeredAlready(e, body.install_id)), {
       freshNonce,
       recovery,
+      from,
       device: { name: browserName(), app_version: appVersion, capabilities },
     });
+    // Taken here or by another tab (which may be gone): the new lineage and cursor, if still missing.
+    await this.#complete(head);
+  }
+
+  /**
+   * #complete gives a registered installation without a cursor (a successor
+   * after a refused push, PROTOCOL §12) the server's lineage and cursor: the
+   * head given, else the summary's. It is idempotent, and returns whether it
+   * set a cursor.
+   */
+  async #complete(head?: Head): Promise<boolean> {
+    const inst = await installation(this.session.db, this.account);
+    if (inst.successor || inst.cursor || !inst.registered) return false;
     const h = head ?? (await reads.summary()).head;
+    let done = false;
     await updateInstallation(this.session.db, this.account, (r) => {
-      r.lineage = { log_id: h.log_id, epoch: h.epoch };
+      if (r.successor || r.cursor || staleLineage(r, h)) return;
+      retireLineage(r, h);
       r.cursor = h.cursor;
+      done = true;
     });
+    return done;
   }
 
   notify(text: string, action?: Notice["action"]): number {
@@ -222,24 +352,32 @@ export class Sync {
     try {
       // A successor handoff left unfinished goes first, then a recovery after a
       // restore; both resume after a reload (PROTOCOL §12).
-      if ((await installation(this.session.db, this.account)).successor) await this.#handoff(false);
+      // Only that handoff: if another tab finishes it meanwhile, none is taken here.
+      const inst = await installation(this.session.db, this.account);
+      if (inst.successor && !(await this.successor(false, undefined, inst.install_id))) return; // another tab registers it
       const rec = await recover(this.session.db, this.account, recoveryApi);
       if (rec) {
         this.recovery.set(rec);
-        if (rec.recovered > 0) this.changed.set(this.changed.get() + 1);
+        if (rec.recovered > 0) this.#revalidate();
       }
+      const pushedAs = (await installation(this.session.db, this.account)).install_id;
       const out = await pushAll(this.session.db, this.account, (body) => post<PushResponse>("/v1/push", body).then((r) => this.#received(r)));
       await this.#fromJournal();
       this.connection.set("online");
       this.refused.set(null);
       if (out.stopped === "lineage_mismatch" || out.stopped === "conflict") {
         // A restored server, or another profile sharing this transport.
-        await this.successor(out.stopped === "conflict");
+        if (await this.successor(out.stopped === "conflict", undefined, pushedAs)) this.#again = true;
+        return;
+      }
+      // Changes to send and no cursor: a successor another tab took and could not finish.
+      if (out.stopped === "no_cursor" && (await entries(this.session.db, this.account)).some((e) => !e.receipt) && (await this.#complete())) {
         this.#again = true;
         return;
       }
       this.pending.set(out.remaining);
       this.waiting.set(out.waiting);
+      this.unsendable.set(out.stopped === "too_large");
       if (out.stopped === "paused" || out.stopped === "lineage_unknown") {
         this.paused.set(out.stopped);
       }
@@ -271,11 +409,18 @@ export class Sync {
   #received(r: PushResponse): PushResponse {
     const receipts = r.results.flatMap((res) => (res.receipt ? [res.receipt] : []));
     for (const receipt of receipts) this.#deliver(receipt.op_id, receipt);
-    if (receipts.length) {
-      // The change may be another tab's: its outcome is that tab's to show.
-      this.#receipts?.postMessage({ receipts });
-      this.changed.set(this.changed.get() + 1);
+    // The change may be another tab's: its outcome is that tab's to show.
+    if (receipts.length) this.#receipts?.postMessage({ receipts });
+    // The server's head after the push: views re-read once for it (its event
+    // for the same head then changes nothing). A head that is not a contract
+    // cursor is the push loop's to refuse.
+    let head: HeadLike | null = null;
+    try {
+      head = decodeCursor(r.head);
+    } catch {
+      /* refused by pushAll */
     }
+    if (head) void this.learn(head).catch((e: unknown) => console.error("sync: learn", e));
     return r;
   }
 
@@ -284,17 +429,22 @@ export class Sync {
     this.schedule(this.#backoff);
   }
 
-  /** start pushes what an earlier load left, opens the event stream and watches focus. */
+  /** start pushes what an earlier load left, opens the event stream and watches focus and visibility. */
   start(): () => void {
     this.schedule(0);
-    const reread = () => this.changed.set(this.changed.get() + 1);
+    let opened = false;
+    const changed = (ev: Event) => this.heard(String((ev as MessageEvent).data));
     const open = () => {
       this.#events?.close();
       const es = new EventSource("/v1/events");
-      es.addEventListener("changed", reread);
+      es.addEventListener("changed", changed);
       es.addEventListener("open", () => {
         this.connection.set("online");
-        reread();
+        // A reconnect may have missed events: views revalidate. The first
+        // opening needs none: the views are reading, and its first event
+        // names the head they must reach.
+        if (opened) this.#revalidate();
+        opened = true;
       });
       es.addEventListener("closed", () => {
         // The server ended the stream. A session it no longer takes is an account
@@ -318,18 +468,24 @@ export class Sync {
     };
     open();
     const focus = () => {
-      reread();
+      this.#revalidate();
       this.schedule(0);
     };
     window.addEventListener("focus", focus);
-    const online = () => this.schedule(0);
+    const online = () => {
+      this.#revalidate();
+      this.schedule(0);
+    };
     window.addEventListener("online", online);
+    const visibility = () => this.visible.set(document.visibilityState !== "hidden");
+    document.addEventListener("visibilitychange", visibility);
     return () => {
       this.#receipts?.close();
       this.#receipts = null;
       this.#events?.close();
       window.removeEventListener("focus", focus);
       window.removeEventListener("online", online);
+      document.removeEventListener("visibilitychange", visibility);
       if (this.#timer) clearTimeout(this.#timer);
     };
   }

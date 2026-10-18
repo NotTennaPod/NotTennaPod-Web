@@ -8,6 +8,7 @@
 // through the read API (position, played time, last played, history).
 import { expect, test, type BrowserContext, type Page } from "@playwright/test";
 import { startServer, type RunningServer } from "./support/server.ts";
+import { notNow } from "./support/offer.ts";
 import { startPublisher, type Publisher, type FixtureEpisode } from "./support/player.ts";
 
 test.describe.configure({ mode: "serial" });
@@ -128,6 +129,46 @@ async function audio(p: Page): Promise<{ t: number; paused: boolean; rate: numbe
   });
 }
 
+/**
+ * playedRate is how many seconds of media play in a second, measured in the
+ * page: each sample pairs the media time with the page's monotonic clock at
+ * the same timeupdate, so nothing of the test runner or its round trips is
+ * in the window. The window opens after a second and a half of media, past
+ * the engine's start-up (WebKit's media clock catches up during it). A window
+ * that waiting, a stall, a pause or a seek interrupted is measured again.
+ */
+async function playedRate(p: Page, mediaMs: number): Promise<number> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const m = await p.evaluate(async (span) => {
+      const a = document.querySelector("audio")!;
+      let interrupted = false;
+      const interrupt = () => (interrupted = true);
+      const events = ["waiting", "stalled", "pause", "seeking", "emptied"];
+      for (const ev of events) a.addEventListener(ev, interrupt);
+      const update = () =>
+        new Promise<{ media: number; at: number }>((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error("the media time stopped")), 10_000);
+          a.addEventListener("timeupdate", () => {
+            clearTimeout(timer);
+            resolve({ media: a.currentTime * 1000, at: performance.now() });
+          }, { once: true });
+        });
+      try {
+        const start = await update();
+        let first = start;
+        while (!interrupted && first.media - start.media < 1_500) first = await update();
+        let last = first;
+        while (!interrupted && last.media - first.media < span) last = await update();
+        return { media: last.media - first.media, wall: last.at - first.at, interrupted };
+      } finally {
+        for (const ev of events) a.removeEventListener(ev, interrupt);
+      }
+    }, mediaMs);
+    if (!m.interrupted) return m.media / m.wall;
+  }
+  throw new Error("playback was interrupted in every measurement");
+}
+
 async function reaches(p: Page, ms: number, timeout = 30_000): Promise<void> {
   await expect.poll(async () => (await audio(p)).t, { timeout }).toBeGreaterThanOrEqual(ms);
 }
@@ -173,6 +214,7 @@ test("set up and subscribe to a show with HTTPS episodes", async () => {
   await page.getByLabel("Password").fill(password);
   await page.getByRole("button", { name: "Create account" }).click();
   await expect(page.locator("nav.drawer")).toBeVisible();
+  await notNow(page);
   await expect(bar(page)).toHaveCount(0);
   await page.goto(server.base + "/add");
   await page.getByLabel("Add podcast by RSS address").fill(publisher.feedURL);
@@ -239,13 +281,12 @@ test("seeking, the skip intervals and the speed; speed is not counted as listeni
   await expect(d.getByRole("button", { name: "Playback speed" })).toContainText("1.50");
   expect((await audio(page)).rate).toBe(1.5);
   await d.getByRole("button", { name: "Play", exact: true }).click();
-  const t0 = Date.now();
-  const a0 = (await audio(page)).t;
-  await reaches(page, a0 + 6_000);
+  await expect(d.getByRole("button", { name: "Pause" })).toBeVisible();
+  const rate = await playedRate(page, 9_000);
+  expect(rate, "1.5× plays 1.5 seconds of media a second").toBeGreaterThan(1.455);
+  expect(rate).toBeLessThan(1.545);
   await d.getByRole("button", { name: "Pause" }).click();
-  const wall = Date.now() - t0;
   const a1 = (await audio(page)).t;
-  expect((a1 - a0) / wall, "1.5× plays 1.5 seconds of media a second").toBeGreaterThan(1.2);
   await settled(page);
   const s = await listening(page, 1);
   near(s.position, a1, 600);
@@ -379,16 +420,111 @@ test("a paused player adopts a phone's newer position; resuming starts a new ses
   near(s.played - before.played, s.position - (200_000 - 800), 600);
 });
 
+/** Device is another device of the account (a phone) writing through the sync API: its token, installation and author chain. */
+interface Device {
+  token: string;
+  install: string;
+  author: string;
+  seq: number;
+  last: string | null;
+}
+
+async function signInDevice(p: Page): Promise<Device> {
+  return p.evaluate(
+    async ({ user, password }) => {
+      const install = crypto.randomUUID();
+      const res = await fetch("/v1/auth/device", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: user, password, install_id: install, instance_nonce: crypto.randomUUID(),
+          device: { name: "Phone", platform: "android", app_version: "1", capabilities: ["favorites", "history", "inbox", "queue", "statistics"] } }),
+      }).then((r) => r.json());
+      return { token: res.token as string, install, author: crypto.randomUUID(), seq: 0, last: null };
+    },
+    { user, password },
+  );
+}
+
+/** devicePushes pushes the device's next fact on episode n, depending on what it read and on its own previous fact. */
+async function devicePushes(p: Page, d: Device, n: number, type: string, payload: Record<string, unknown>): Promise<{ device: Device; status: string; op: string }> {
+  return p.evaluate(
+    async ({ d, id, type, payload }) => {
+      const json = (r: Response) => r.json();
+      const ep = await fetch(`/v1/read/episodes/${encodeURIComponent(id)}`).then(json);
+      const { frontier } = await fetch(`/v1/read/frontier?cursor=${encodeURIComponent(ep.head.cursor)}`).then(json);
+      const e = ep.episode;
+      const ref = { episode_id: e.episode_id, podcast_id: e.podcast_id, generation_id: e.podcast.generation_id, occurrence: e.records.identity.value.occurrence };
+      const fact: Record<string, unknown> = {
+        op_id: crypto.randomUUID(), author_id: d.author, author_seq: d.seq + 1,
+        dependencies: [...new Set([...frontier, ...(d.last ? [d.last] : [])])].sort(), type, type_version: 1, client_time: Date.now(),
+        targets: [{ entity: "episode", id: e.episode_id, generation: ref.generation_id }], payload: { episode: ref, ...payload },
+      };
+      if (d.last) fact.previous_op_id = d.last;
+      const res = await fetch("/v1/push", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${d.token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ cursor: ep.head.cursor, install_id: d.install, acked_install_seq: d.seq, operations: [{ install_seq: d.seq + 1, fact }] }),
+      }).then(json);
+      const op = fact.op_id as string;
+      return { status: (res.results?.[0]?.status as string) ?? JSON.stringify(res), op, device: { ...d, seq: d.seq + 1, last: op } };
+    },
+    { d, id: ids[n - 1]!, type, payload },
+  );
+}
+
+test("a paused player follows a phone that plays on and pauses, without the phone playing again", async () => {
+  await settled(page);
+  // The phone plays the episode from 4:10: the paused browser follows it.
+  let phone = await signInDevice(page);
+  const session = crypto.randomUUID();
+  const start = await devicePushes(page, phone, 1, "session.start", { session_id: session, start_position: 250_000, activity: true });
+  expect(start.status).toBe("accepted");
+  phone = start.device;
+  await expect.poll(async () => (await audio(page)).t, { timeout: 20_000 }).toBe(250_000);
+  // The phone pauses at 4:40 (its pause checkpoint, under the same claim): the browser shows that, with no new play on the phone.
+  const pause = await devicePushes(page, phone, 1, "session.checkpoint", { session_id: session, ordinal: 1, position: 280_000, contribution: 30_000, activity: true });
+  expect(pause.status).toBe("accepted");
+  const server = await listening(page, 1);
+  expect([server.position, server.claim]).toEqual([280_000, start.op]);
+  await expect.poll(async () => (await audio(page)).t, { timeout: 20_000 }).toBe(280_000);
+  await expect(bar(page).getByRole("button", { name: "Play", exact: true })).toBeVisible();
+  // Play here starts from there.
+  await bar(page).getByRole("button", { name: "Play", exact: true }).click();
+  await playing(page);
+  await reaches(page, 281_000);
+  await bar(page).getByRole("button", { name: "Pause" }).click();
+  await paused(page);
+  await settled(page);
+  const s = await listening(page, 1);
+  expect(s.claim, "playing here is a new claim").not.toBe(start.op);
+  expect(s.position).toBeGreaterThan(280_000);
+});
+
 test("a reload loads the episode paused without writing anything, and play resumes the session", async () => {
   await settled(page);
   const before = await listening(page, 1);
   const known = new Set((await sessions(page)).map((x) => x.session_id));
   const open = (await sessions(page)).filter((x) => x.episode_id === ids[0] && !x.sealed && !x.closed).map((x) => x.session_id);
   expect(open.length).toBe(1);
+  // The publisher's file as the reloaded page asks for it (from its document's start).
+  const ranges: string[] = [];
+  let reloaded = false;
+  page.once("framenavigated", () => (reloaded = true));
+  const asked = (r: { url(): string; headers(): Record<string, string> }) => {
+    if (reloaded && new URL(r.url()).pathname === "/media/episode-1.wav") ranges.push(r.headers()["range"] ?? "");
+  };
+  page.on("request", asked);
   await page.reload();
   await expect(bar(page).locator(".player-bar-title")).toHaveText("Player episode 1");
   await paused(page);
-  await expect.poll(async () => (await audio(page)).t).toBe(before.position);
+  // At the saved position, within what anyone could hear: the element reports
+  // its time a millisecond on from the one the pause saved in some engines.
+  await expect.poll(async () => Math.abs((await audio(page)).t - before.position)).toBeLessThanOrEqual(100);
+  // The page fetches the file from its start: a page given the previous page's
+  // download (Firefox) asks mid-file first, which Firefox may refuse from
+  // another site as a page's first media request, and the publisher's URL fails.
+  expect(ranges[0], `the first request of the file: ${ranges.join(", ")}`).toMatch(/^(bytes=0-\d*)?$/);
+  page.off("request", asked);
   await page.waitForTimeout(1500); // a passive load writes nothing, even later
   await settled(page);
   const after = await listening(page, 1);
@@ -405,6 +541,44 @@ test("a reload loads the episode paused without writing anything, and play resum
   expect(now.filter((x) => !known.has(x.session_id)), "no new session").toEqual([]);
   expect(now.filter((x) => x.episode_id === ids[0] && !x.sealed && !x.closed).map((x) => x.session_id), "the tab's open session resumed").toEqual(open);
   expect((await listening(page, 1)).position).toBeGreaterThan(before.position + 1_000);
+});
+
+test("Play, Pause and a seek act at once while a background read of the episode is slow", async () => {
+  await settled(page);
+  // The server answers this episode's reads only when released: a slow connection, a busy server.
+  const path = `/v1/read/episodes/${encodeURIComponent(ids[0]!)}`;
+  let release!: () => void;
+  const released = new Promise<void>((r) => (release = r));
+  let held = 0;
+  const episodeRead = (u: URL) => u.pathname === path;
+  await page.route(
+    episodeRead,
+    async (route) => {
+      held++;
+      await released;
+      await route.continue().catch(() => {}); // the page may have given up on it
+    },
+  );
+  try {
+    // Coming back to the window re-reads what is shown: the player's background read of its episode waits.
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await expect.poll(() => held).toBeGreaterThan(0);
+    const at = (await audio(page)).t;
+    await bar(page).getByRole("button", { name: "Play", exact: true }).click();
+    await expect(bar(page).getByRole("button", { name: "Pause" })).toBeVisible({ timeout: 2_000 });
+    await reaches(page, at + 1_000, 5_000);
+    await bar(page).getByRole("button", { name: "Pause" }).click();
+    await expect(bar(page).getByRole("button", { name: "Play", exact: true })).toBeVisible({ timeout: 2_000 });
+    const d = await openPlayer(page);
+    await d.getByRole("slider", { name: "Position" }).fill("150000");
+    await expect.poll(async () => (await audio(page)).t, { timeout: 2_000 }).toBe(150_000);
+    await page.keyboard.press("Escape");
+  } finally {
+    release();
+    await page.unroute(episodeRead);
+  }
+  await settled(page);
+  expect((await sessions(page)).filter((x) => x.episode_id === ids[0] && !x.sealed && !x.closed).length, "the same session played on").toBe(1);
 });
 
 test("two tabs: the other shows Playing in another tab, and moving playback hands over with a final save", async () => {
@@ -429,7 +603,6 @@ test("two tabs: the other shows Playing in another tab, and moving playback hand
 });
 
 test("playback continues in a background tab, with checkpoints while it plays", async () => {
-  test.setTimeout(240_000);
   const other = await context.newPage();
   await other.goto(server.base + "/statistics");
   await other.bringToFront();

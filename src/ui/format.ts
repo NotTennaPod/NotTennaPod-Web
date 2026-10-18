@@ -26,3 +26,10 @@ export function hoursMinutes(ms: number): { h: number; m: number } {
   const minutes = Math.floor(ms / 60000);
   return { h: Math.floor(minutes / 60), m: minutes % 60 };
 }
+
+/** bytes is a size as the server page and the import show it: KB, MB or GB. */
+export function bytes(n: number): string {
+  if (n >= 1 << 30) return `${(n / (1 << 30)).toFixed(1)} GB`;
+  if (n >= 1 << 20) return `${(n / (1 << 20)).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(n / 1024))} KB`;
+}

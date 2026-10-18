@@ -2,7 +2,7 @@
 // header, Subscribe for a preview, the episode list with Android's filter and
 // sort, the account-level settings (keep updated, new episodes action,
 // credentials shown as set), the statistics card, archive and unsubscribe.
-import { useState } from "preact/hooks";
+import { useRef, useState } from "preact/hooks";
 import { t, w, plural, type StringKey } from "../i18n.ts";
 import { reads, type PodcastRow } from "../api/views.ts";
 import * as act from "../app/actions.ts";
@@ -10,7 +10,7 @@ import { useSync } from "../app/context.ts";
 import { navigate } from "../app/router.ts";
 import { useView } from "../app/useView.ts";
 import { Cover } from "../ui/Cover.tsx";
-import { Confirm, Empty, Loading, Menu, Toolbar, type MenuItem } from "../ui/components.tsx";
+import { Confirm, Empty, Loading, Menu, RefreshBar, Toolbar, refreshItem, type MenuItem } from "../ui/components.tsx";
 import { AuthenticationDialog, RemoveFeedDialog, removeAllInbox } from "../ui/podcastDialogs.tsx";
 import { feedURL } from "../app/feedLogin.ts";
 import { EpisodeList, usePaged } from "../ui/EpisodeList.tsx";
@@ -18,6 +18,8 @@ import { SortDialog, dateOption, durationOption, titleOption } from "../ui/SortD
 import { durationLong } from "../ui/format.ts";
 import { useLocalSetting } from "../ui/settings.ts";
 import { track } from "../ui/progress.ts";
+import { failure, type RefreshError } from "../ui/feedStatus.ts";
+import { FeedErrorDialog } from "../ui/FeedErrorDialog.tsx";
 
 const actions: [string, StringKey][] = [
   ["global", "global_default"],
@@ -35,6 +37,10 @@ export function Podcast({ id }: { id: string }) {
   const [clearing, setClearing] = useState(false);
   const [sorting, setSorting] = useState(false);
   const [authenticating, setAuthenticating] = useState(false);
+  // What the details dialog shows: the podcast and the failure the notice showed when it was opened,
+  // together, so an error is never shown with another podcast's name or address.
+  const [details, setDetails] = useState<{ id: string; podcast: PodcastRow; error: RefreshError } | null>(null);
+  const notice = useRef<HTMLButtonElement>(null);
   const p = view.data?.podcast;
   if (!p) return view.error ? <Empty icon="error" title={w("not_found_title")} text={view.error} /> : <Loading />;
   const policy = p.records.policy?.value as { new_episodes_action?: string; keep_updated?: boolean } | undefined;
@@ -62,12 +68,18 @@ export function Podcast({ id }: { id: string }) {
             : { label: t("remove_archive_feed_label"), run: () => setRemoving(true) },
         ];
   const st = p.statistics;
+  const failed = failure(p);
   return (
     // data-podcast-id says which podcast the screen shows (for test drivers; nothing a person sees).
     <section data-podcast-id={p.podcast_id}>
       <Toolbar title={p.display_title ?? p.title ?? ""}>
-        <Menu label={t("overflow_more")} items={[{ label: t("sort"), run: () => setSorting(true) }, ...settings]} />
+        {/* Android's feedlist menu: Sort, then Refresh (this podcast); a preview has no Refresh. */}
+        <Menu
+          label={t("overflow_more")}
+          items={[{ label: t("sort"), run: () => setSorting(true) }, ...(p.state === "not_subscribed" ? [] : [refreshItem(sync, p.podcast_id)]), ...settings]}
+        />
       </Toolbar>
+      <RefreshBar />
       {sorting && (
         <SortDialog options={[titleOption, dateOption, durationOption]} value={order} onChange={setOrder} onClose={() => setSorting(false)} />
       )}
@@ -93,6 +105,12 @@ export function Podcast({ id }: { id: string }) {
           )}
         </div>
       </div>
+      {/* Android's txtvFailure (feeditemlist_header): the last refresh failed; it opens the details. */}
+      {failed && (
+        <button type="button" ref={notice} class="refresh-failed" onClick={() => setDetails({ id, podcast: p, error: failed })}>
+          {t("refresh_failed_msg")}
+        </button>
+      )}
       {meta?.description && <p class="podcast-description">{plainText(meta.description)}</p>}
       <EpisodeList
         key={id}
@@ -101,8 +119,19 @@ export function Podcast({ id }: { id: string }) {
         hasMore={list.hasMore}
         loadMore={list.loadMore}
         loading={list.loading}
+        window={list.window}
         empty={<Empty icon="feed" title={t("no_all_episodes_head_label")} text={t("no_all_episodes_label")} />}
       />
+      {details?.id === id && (
+        <FeedErrorDialog
+          podcast={details.podcast}
+          error={details.error}
+          onClose={() => {
+            setDetails(null);
+            notice.current?.focus();
+          }}
+        />
+      )}
       {authenticating && <AuthenticationDialog sync={sync} podcast={p} onClose={() => setAuthenticating(false)} />}
       {removing && <RemoveFeedDialog sync={sync} podcasts={[p]} onClose={() => setRemoving(false)} onUnsubscribed={() => navigate("/subscriptions")} />}
       {clearing && (

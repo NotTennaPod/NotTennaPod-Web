@@ -5,6 +5,7 @@ import { ApiError, endGeneration, get, post, useAccount } from "../api/http.ts";
 import { openDB, type AuthorRow, type InstallationRow } from "../journal/db.ts";
 import { installation, newAuthor, updateInstallation } from "../journal/journal.ts";
 import { takeSuccessor } from "../journal/successor.ts";
+import { offerState, setOffer } from "../ui/recoveryKey.ts";
 
 export interface Account {
   account_id: string;
@@ -57,15 +58,26 @@ export async function boot(): Promise<BootResult> {
   useAccount(account.account_id);
   const db = await database();
   let inst = await installation(db, account.account_id);
-  if (who.install_id && who.install_id === inst.successor?.install_id) {
-    // The server registered the planned successor and bound this session to
-    // it, but the tab closed before renumbering (PROTOCOL §12): finish the handoff.
-    inst = await takeSuccessor(db, account.account_id, async () => undefined, {
-      freshNonce: false,
-      device: { name: browserName(), app_version: appVersion, capabilities },
-    });
-  }
-  if (who.install_id && who.install_id !== inst.install_id) {
+  for (let asked = 1; ; asked++) {
+    if (who.install_id && who.install_id === inst.successor?.install_id) {
+      // The server registered the planned successor and bound this session to
+      // it, but the tab closed before renumbering (PROTOCOL §12): finish that
+      // plan, or take the installation as another tab finished it.
+      inst = await takeSuccessor(db, account.account_id, async () => undefined, {
+        freshNonce: false,
+        from: inst.install_id,
+        registered: who.install_id,
+        device: { name: browserName(), app_version: appVersion, capabilities },
+      });
+    }
+    if (!who.install_id || who.install_id === inst.install_id) break;
+    // An installation this profile has left: the answer was asked before
+    // another tab's handoff gave the browser its successor's session. Ask again.
+    if (asked === 1 && inst.predecessors.includes(who.install_id)) {
+      who = await get<{ account: Account; install_id: string | null }>("/v1/session");
+      inst = await installation(db, account.account_id);
+      continue;
+    }
     // The session belongs to another installation: a copied or cleared
     // profile. Signing in again gives this profile its own session.
     return { kind: "conflict" };
@@ -95,9 +107,21 @@ export async function signIn(username: string, password: string): Promise<void> 
   announce("signed_in");
 }
 
-/** setUp creates the first administrator with the setup code (PROTOCOL §5). */
+/**
+ * setUp creates the first administrator with the setup code (PROTOCOL §5).
+ * The recovery key is offered once afterwards: the offer is noted before
+ * asking, so an answer lost on the way or a tab closed meanwhile keeps it,
+ * and taken back only when the server refuses the setup.
+ */
 export async function setUp(username: string, password: string, code: string): Promise<void> {
-  await post("/v1/setup", { username, password, setup_code: code });
+  const before = offerState();
+  setOffer("pending");
+  try {
+    await post("/v1/setup", { username, password, setup_code: code });
+  } catch (e) {
+    if (e instanceof ApiError) setOffer(before);
+    throw e;
+  }
   announce("signed_in");
 }
 

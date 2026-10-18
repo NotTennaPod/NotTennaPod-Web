@@ -15,6 +15,7 @@ import { buildSync } from "esbuild";
 import { join } from "node:path";
 import { root } from "./support/build.ts";
 import { startServer, type RunningServer } from "./support/server.ts";
+import { notNow } from "./support/offer.ts";
 import { startPublisher, type Publisher } from "./support/player.ts";
 
 test.describe.configure({ mode: "serial" });
@@ -45,6 +46,7 @@ test.beforeAll(async ({ browser }) => {
   await page.getByLabel("Password").fill("feed account password");
   await page.getByRole("button", { name: "Create account" }).click();
   await expect(page.locator("nav.drawer")).toBeVisible();
+  await notNow(page);
   await page.goto(server.base + "/add");
   await page.getByLabel("Add podcast by RSS address").fill(publisher.feedURL);
   await page.getByRole("button", { name: "Episodes preview" }).click();
@@ -136,7 +138,6 @@ const state = (p: Page) =>
 const token = () => streams[0]!.url.split("?")[0]!;
 
 test("a sustained pause stops the transfer at the window, and playing on continues the conversion where it ends, at speed", async () => {
-  test.setTimeout(240_000);
   // A 60 s window, continued when 30 s remain ahead; from 1:00 of a 30-minute episode.
   await start(page, 60_000, { aheadS: 60, resumeS: 30 }, 3);
   await expect.poll(async () => (await state(page)).time, { timeout: 30_000 }).toBeGreaterThan(1);
@@ -171,7 +172,6 @@ test("a sustained pause stops the transfer at the window, and playing on continu
 });
 
 test("a transfer left open and silent is a stall: the player reloads at its position and plays on", async () => {
-  test.setTimeout(120_000);
   await start(page, 300_000, { stallMs: 3_000 }, 1, "silent-after-prefix");
   // About ten seconds arrive, then nothing: playback reaches the silence and waits; the stall bound ends it.
   await expect.poll(async () => (await state(page)).calls.describes, { timeout: 60_000 }).toBeGreaterThanOrEqual(2);
@@ -189,7 +189,6 @@ test("a transfer left open and silent is a stall: the player reloads at its posi
 });
 
 test("a stall while paused reloads at the position and stays paused", async () => {
-  test.setTimeout(120_000);
   await start(page, 300_000, { stallMs: 3_000 }, 1, "silent-after-prefix");
   await expect.poll(async () => (await state(page)).time, { timeout: 30_000 }).toBeGreaterThan(1);
   await page.evaluate(() => (window as unknown as Record<string, any>).player.pause());
