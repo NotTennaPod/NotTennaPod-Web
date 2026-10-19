@@ -433,12 +433,41 @@ export function usePaged<T>(
   };
 
   /**
+   * ofSelection reads rows [from, from + limit) of the view a selection holds, as
+   * Select all reads it: walking it from its start by the tokens it gave, so
+   * rows let go of above (Load more) come back at the selection's head. The
+   * window it makes continues by the token after its last row.
+   */
+  const ofSelection = async (h: Held<T>, from: number, limit: number): Promise<Omit<Held<T>, "spacer" | "perRow" | "below">> => {
+    const origin = selOrigin.current ?? h.origin;
+    const rows: T[] = [];
+    let at = 0; // the index the token reads from
+    let token: string | null;
+    if ("rows" in origin) {
+      rows.push(...origin.rows.slice(from));
+      at = origin.rows.length;
+      token = origin.next;
+    } else token = origin.token;
+    const end = Math.max(from + limit, at);
+    while (token && at < end) {
+      // Pages end where the rows wanted start, and where they end: the token after them is the window's.
+      const page = await load({ page_token: token, limit: Math.min(500, (at < from ? from : end) - at) }, new AbortController().signal);
+      if (at >= from) rows.push(...page.items);
+      at += page.items.length;
+      token = page.next_page_token;
+      if (!page.items.length) break;
+    }
+    return { ...h, lo: from, rows, next: token, prev: null };
+  };
+
+  /**
    * previousOnce reads rows above the window. Near it: the server's page
    * before the window (same view), else a window anchored on the first row
    * held with rows before it. Far above it (a jump): one window where the
    * screen is, the first page near the top, else the window at the screen's
    * index (`anchor_index` without an anchor, PROTOCOL §12), shown at the
-   * place the spacer gave it.
+   * place the spacer gave it. While a selection holds the list, those rows
+   * are read from the selection's view.
    */
   const previousOnce = async (): Promise<void> => {
     const h = live.current;
@@ -464,11 +493,18 @@ export function usePaged<T>(
         const before = Math.min(h.lo, pageRows);
         q = { anchor: idOf(h.rows[0]!), anchor_index: h.lo, before, limit: before + Math.min(h.rows.length, pageRows) };
       }
-      const page = await load(q, new AbortController().signal);
-      if (live.current !== h) return;
-      if (!(await acceptable(sync, page.head, h.head, new AbortController().signal))) return;
-      if (live.current !== h) return;
-      const n = windowOf(page, page.items, page.next_page_token, q.limit ?? pageRows);
+      let n: Omit<Held<T>, "spacer" | "perRow" | "below">;
+      if (holding.current) {
+        // The anchored window's rows, of the selection's view: a newer head's would wait until it ends.
+        n = await ofSelection(h, top ? 0 : Math.max(0, (q.anchor_index ?? 0) - (q.before ?? 0)), q.limit ?? windowRows);
+        if (live.current !== h) return;
+      } else {
+        const page = await load(q, new AbortController().signal);
+        if (live.current !== h) return;
+        if (!(await acceptable(sync, page.head, h.head, new AbortController().signal))) return;
+        if (live.current !== h) return;
+        n = windowOf(page, page.items, page.next_page_token, q.limit ?? pageRows);
+      }
       // A window read away from what is on screen now is not shown (the screen moved on).
       if (!covers(n.rows)) return;
       // While held, only the same head joins (the selection's view stays); a newer one waits.

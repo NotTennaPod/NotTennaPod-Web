@@ -606,13 +606,14 @@ test("playback continues in a background tab, with checkpoints while it plays", 
   const other = await context.newPage();
   await other.goto(server.base + "/statistics");
   await other.bringToFront();
-  // Headless pages stay visible; tell the playing tab it is hidden, as a browser would.
+  await settled(page2);
+  // Headless pages stay visible; tell the playing tab it is hidden, as a browser would. It journals
+  // its position for its departure, which the next checkpoint's push carries.
   await page2.evaluate(() => {
     Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
     Object.defineProperty(document, "hidden", { value: true, configurable: true });
     document.dispatchEvent(new Event("visibilitychange"));
   });
-  await settled(page2);
   const start = await listening(other, 1);
   const a0 = (await audio(page2)).t;
   // A checkpoint is exported at most once a minute while playing: wait for one to land.

@@ -5,11 +5,12 @@
 // once per newer head; reconnects, focus, online, a recovery and a successor
 // make them revalidate. With the server unreachable, one banner says so and
 // controls wait.
-import { ApiError, get, post, refused, Unreachable } from "../api/http.ts";
+import { ApiError, get, post, postKeepalive, refused, request, Unreachable } from "../api/http.ts";
 import type { Counters, Head } from "../api/views.ts";
 import type { EntryRow, Receipt } from "../journal/db.ts";
 import { append, appendAll, entries, installation, lineages, outcomeShown, retire, retireLineage, staleLineage, updateInstallation, type FactBody, type Lineages } from "../journal/journal.ts";
-import { decodeCursor, pushAll, type PushResponse } from "../journal/pusher.ts";
+import { decodeCursor, defaultBounds, leavingPush, pushAll, type Bounds, type PushResponse } from "../journal/pusher.ts";
+import { utf8 } from "../journal/jcs.ts";
 import { planSuccessor, retainedEntries, SuccessorBusy, takeSuccessor } from "../journal/successor.ts";
 import { recover, type RecoveryState, type RecoveryTransport } from "../journal/recovery.ts";
 import { appVersion, browserName, capabilities, type Session } from "./boot.ts";
@@ -41,6 +42,18 @@ async function registeredAlready(e: unknown, installId: string): Promise<void> {
   throw e;
 }
 
+/**
+ * pushDeadline is how long a push of a body of this many bytes may go
+ * unanswered (a connection stalled by sleep or a weak network) before it is
+ * cancelled and sent again with the same slots, which the server answers as
+ * it did if it had them (PROTOCOL §6.4): a minute, and a slow link's time for
+ * the body (16 KB/s). A slower link gets smaller pushes (Sync.#batch).
+ */
+export const pushDeadline = (bytes: number) => 60_000 + bytes / 16;
+
+/** PushTimeout is a push its deadline cancelled. */
+class PushTimeout extends Error {}
+
 export class Sync {
   readonly session: Session;
   readonly connection = new Value<Connection>("online");
@@ -70,6 +83,8 @@ export class Sync {
   #timer: ReturnType<typeof setTimeout> | undefined;
   #running = false;
   #again = false;
+  /** #versionCheck: the next push sends again what a server refused as too new (a page load, a reconnect: it may have been updated). */
+  #versionCheck = true;
   #backoff = 0;
   #events: EventSource | undefined;
   #noticeId = 0;
@@ -78,8 +93,30 @@ export class Sync {
   /** #receipts reaches the profile's other tabs: whichever tab pushes a change, its outcome reaches the tab that made it. */
   #receipts: BroadcastChannel | null;
 
-  constructor(session: Session) {
+  #pushDeadline: (bytes: number) => number;
+  /**
+   * #batch is the most facts a push carries: halved after a push its deadline
+   * cancelled, down to one fact (or part), so whole facts move however slow
+   * the upload; doubled back after each push answered. The facts keep their
+   * slots and order: a push always sends the front of what is unsent.
+   */
+  #batch = defaultBounds.max_operations;
+  #bounds: Bounds;
+  /** #prepared is the push a page going away sends (leavingPush), built while the page can read the journal. */
+  #prepared: Record<string, unknown> | null = null;
+  #preparing: Promise<void> | null = null;
+  #prepareAgain = false;
+
+  constructor(session: Session, opts: { pushDeadline?: (bytes: number) => number } = {}) {
     this.session = session;
+    this.#pushDeadline = opts.pushDeadline ?? pushDeadline;
+    const self = this;
+    this.#bounds = {
+      ...defaultBounds,
+      get max_operations() {
+        return self.#batch;
+      },
+    };
     this.#receipts = typeof BroadcastChannel === "undefined" ? null : new BroadcastChannel(`nottennapod-receipts:${session.account.account_id}`);
     this.#receipts?.addEventListener("message", (ev) => {
       const list = (ev as MessageEvent<{ receipts?: unknown }>).data?.receipts;
@@ -95,17 +132,26 @@ export class Sync {
   /** act journals an action; it is done once this resolves (PROTOCOL §12). */
   async act(body: FactBody): Promise<EntryRow> {
     const entry = await append(this.session.db, this.account, this.session.author.author_id, body);
-    this.pending.set(this.pending.get() + 1);
-    this.schedule(0);
+    this.journaled(1);
     return entry;
   }
 
   /** actAll journals an action made of several facts (actions.chunks), all in one transaction; it is done once this resolves. */
   async actAll(bodies: FactBody[]): Promise<EntryRow[]> {
     const entries = await appendAll(this.session.db, this.account, this.session.author.author_id, bodies);
-    this.pending.set(this.pending.get() + entries.length);
-    this.schedule(0);
+    this.journaled(entries.length);
     return entries;
+  }
+
+  /**
+   * journaled takes facts just journaled (an action, a player's export): they
+   * are pushed, and the departure's push is prepared again with them at once,
+   * whatever becomes of a push still under way.
+   */
+  journaled(n: number): void {
+    this.pending.set(this.pending.get() + n);
+    this.schedule(0);
+    void this.prepare();
   }
 
   /**
@@ -360,8 +406,16 @@ export class Sync {
         this.recovery.set(rec);
         if (rec.recovered > 0) this.#revalidate();
       }
+      if (this.#versionCheck) {
+        // A server that refused this browser's facts as too new pauses pushing until it is
+        // updated (PROTOCOL §10.2): the same facts are sent again, and a refusal pauses again.
+        await updateInstallation(this.session.db, this.account, (r) => {
+          if (r.paused === "version_unsupported") r.paused = null;
+        });
+        this.#versionCheck = false;
+      }
       const pushedAs = (await installation(this.session.db, this.account)).install_id;
-      const out = await pushAll(this.session.db, this.account, (body) => post<PushResponse>("/v1/push", body).then((r) => this.#received(r)));
+      const out = await pushAll(this.session.db, this.account, (body) => this.#send(body), this.#bounds);
       await this.#fromJournal();
       this.connection.set("online");
       this.refused.set(null);
@@ -380,6 +434,8 @@ export class Sync {
       this.unsendable.set(out.stopped === "too_large");
       if (out.stopped === "paused" || out.stopped === "lineage_unknown") {
         this.paused.set(out.stopped);
+      } else if (this.paused.get() && !(await installation(this.session.db, this.account)).paused) {
+        this.paused.set(null); // resumed (here or in another tab)
       }
       if (out.waiting) this.#retryLater();
       else this.#backoff = 0;
@@ -387,6 +443,8 @@ export class Sync {
       if (e instanceof Unreachable) {
         this.connection.set("unreachable");
         this.#retryLater();
+      } else if (e instanceof PushTimeout) {
+        this.schedule(0); // at once, smaller: the time is in the deadline already
       } else if (e instanceof ApiError && (e.code === "server_busy" || e.code === "rate_limited")) {
         this.schedule((e.retryAfter ?? 5) * 1000);
       } else if (e instanceof ApiError && (e.status === 400 || e.status === 413)) {
@@ -403,7 +461,61 @@ export class Sync {
         this.#again = false;
         this.schedule(0);
       }
+      void this.prepare(); // what is left unsent, and what was journaled meanwhile
     }
+  }
+
+  /** #send sends one push; one unanswered by its deadline is cancelled (PushTimeout, which the push loop retries smaller), so it never holds the loop. */
+  async #send(body: Record<string, unknown>): Promise<PushResponse> {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), this.#pushDeadline(utf8(JSON.stringify(body)).length));
+    const sent = (body.operations as unknown[]).length;
+    try {
+      const r = await request<PushResponse>("POST", "/v1/push", body, ac.signal);
+      this.#batch = Math.min(defaultBounds.max_operations, this.#batch * 2);
+      return this.#received(r);
+    } catch (e) {
+      if (!ac.signal.aborted) throw e;
+      this.#batch = Math.max(1, Math.floor(sent / 2));
+      throw new PushTimeout("push: no answer in time");
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * prepare builds the push a page going away sends, from the journal's
+   * unsent facts as they are now (leavingPush): whenever the journal gains a
+   * fact, after each push, and when the page is hidden. Calls meanwhile build
+   * it once more after.
+   */
+  prepare(): Promise<void> {
+    if (this.#preparing) {
+      this.#prepareAgain = true;
+      return this.#preparing;
+    }
+    this.#preparing = (async () => {
+      do {
+        this.#prepareAgain = false;
+        try {
+          this.#prepared = await leavingPush(this.session.db, this.account);
+        } catch (e) {
+          console.error("sync: prepare", e);
+        }
+      } while (this.#prepareAgain);
+    })().finally(() => (this.#preparing = null));
+    return this.#preparing;
+  }
+
+  /**
+   * leaving sends the prepared push as the page goes away (pagehide): the
+   * request starts at once, as nothing that waits runs after pagehide. Its
+   * facts stay journaled until a push's answer acknowledges them; a resend is
+   * a duplicate (PROTOCOL §6.4).
+   */
+  leaving(): void {
+    const body = this.#prepared;
+    if (body) postKeepalive<PushResponse>("/v1/push", body).catch(() => {});
   }
 
   #received(r: PushResponse): PushResponse {
@@ -442,8 +554,13 @@ export class Sync {
         this.connection.set("online");
         // A reconnect may have missed events: views revalidate. The first
         // opening needs none: the views are reading, and its first event
-        // names the head they must reach.
-        if (opened) this.#revalidate();
+        // names the head they must reach. The server may have been updated
+        // meanwhile: pushes it paused as too new are tried again.
+        if (opened) {
+          this.#revalidate();
+          this.#versionCheck = true;
+          this.schedule(0);
+        }
         opened = true;
       });
       es.addEventListener("closed", () => {
@@ -479,6 +596,8 @@ export class Sync {
     window.addEventListener("online", online);
     const visibility = () => this.visible.set(document.visibilityState !== "hidden");
     document.addEventListener("visibilitychange", visibility);
+    const leaving = () => this.leaving();
+    window.addEventListener("pagehide", leaving);
     return () => {
       this.#receipts?.close();
       this.#receipts = null;
@@ -486,6 +605,7 @@ export class Sync {
       window.removeEventListener("focus", focus);
       window.removeEventListener("online", online);
       document.removeEventListener("visibilitychange", visibility);
+      window.removeEventListener("pagehide", leaving);
       if (this.#timer) clearTimeout(this.#timer);
     };
   }

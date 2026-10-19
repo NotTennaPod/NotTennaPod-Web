@@ -836,6 +836,96 @@ test("a page that goes for good lets go of its media after its last save has the
   assert.ok(last.position >= 9_000, `the last save has the position: ${last.position}`);
 });
 
+test("a hidden page journals its playing position for its departure, without a push, and plays on", async () => {
+  const w = await new World().init();
+  const e = w.episode(1, { queued: true });
+  let appended = 0; // the facts the player handed to the tab's sync to push
+  const a = await w.page(undefined, undefined, { appended: (n) => (appended += n) });
+  await a.player.play(e);
+  await w.listen(a, 7_000);
+  const before = appended;
+  await a.player.hidden();
+  const last = of(await w.facts(), "session.checkpoint").at(-1);
+  assert.equal(last && p(last).position, 7_000, "the position is in the journal");
+  assert.equal(appended, before, "no push for it: the page's departure sends it");
+  assert.equal(a.player.state.playing, true, "playback goes on in the background");
+  wellFormed(await w.facts());
+});
+
+test("a background tab closed while its push is unanswered sends its newest checkpoint", async () => {
+  // The tab's sync (sync.ts) with the real engine: the player's exports reach it as instance.ts passes them.
+  // No other tabs here: the tab's channels to them are left out.
+  const saved = (globalThis as Record<string, unknown>).BroadcastChannel;
+  (globalThis as Record<string, unknown>).BroadcastChannel = undefined;
+  const { Sync } = await import("../src/app/sync.ts");
+  (globalThis as Record<string, unknown>).BroadcastChannel = saved;
+  const realFetch = globalThis.fetch;
+  // The server: the tab's ordinary pushes are never answered (a stalled connection); its keepalive pushes are kept.
+  const cursor = Buffer.from(JSON.stringify({ digest: "0".repeat(64), epoch: 1, log_id: "6a1f0e2c-1111-4222-8333-944455556666", seq: 1 })).toString("base64url");
+  const held: (() => void)[] = [];
+  let answering = false; // after the test: the server answers, so the tab's push loop finishes
+  const keepalive: { fact: Fact }[][] = [];
+  globalThis.fetch = (async (_path: string, init: { body: string; keepalive?: boolean }) => {
+    const body = JSON.parse(init.body) as { operations: { install_seq: number; fact: Fact }[] };
+    const answer = () =>
+      new Response(
+        JSON.stringify({
+          head: cursor,
+          install_watermark: Math.max(0, ...body.operations.map((o) => o.install_seq)),
+          results: body.operations.map((o) => ({
+            install_seq: o.install_seq,
+            status: "accepted",
+            receipt: { op_id: o.fact.op_id, content_hash: "h", outcome: "applied", normalized_time: 0, epoch: 1, seq: 2, index: 0, key_id: "k", mac: "m" },
+          })),
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    if (init.keepalive) {
+      keepalive.push(body.operations);
+      return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } }); // its answer is not read
+    }
+    if (answering) return answer();
+    return new Promise<Response>((resolve) => held.push(() => resolve(answer())));
+  }) as unknown as typeof fetch;
+  let sync: InstanceType<typeof Sync> | undefined;
+  const w = await new World().init();
+  try {
+    await updateInstallation(w.db, w.account, (r) => (r.cursor = cursor));
+    const author = await newAuthor(w.db, w.account);
+    const session = { db: w.db, account: { account_id: w.account, namespace: "n", username: "u", is_admin: false }, author, installation: await installation(w.db, w.account) };
+    (globalThis as Record<string, unknown>).BroadcastChannel = undefined;
+    sync = new Sync(session as never, { pushDeadline: () => 3_600_000 });
+    (globalThis as Record<string, unknown>).BroadcastChannel = saved;
+    const e = w.episode(1, { queued: true });
+    const a = await w.page(undefined, undefined, { appended: (n) => sync!.journaled(n) });
+    await a.player.play(e);
+    await w.listen(a, 20_000);
+    // Hidden at 20 s: the position is journaled and the departure's push prepared (instance.ts).
+    await a.player.hidden();
+    await sync.prepare();
+    // It plays on in the background to 80 s; its minute checkpoint is journaled and its push hangs.
+    await w.listen(a, 60_000);
+    const checkpoints = (facts: Fact[]) => of(facts, "session.checkpoint").map((f) => p(f).position);
+    assert.deepEqual(checkpoints(await w.facts()), [20_000, 80_000], "both checkpoints are journaled");
+    assert.ok(held.length > 0, "the ordinary push is under way, unanswered");
+    // The tab is closed: its keepalive push has the 80 s checkpoint.
+    let sent: number[] = [];
+    for (let i = 0; i < 200 && !sent.includes(80_000); i++) {
+      sync.leaving();
+      sent = checkpoints((keepalive.at(-1) ?? []).map((o) => o.fact));
+      await new Promise((r) => setImmediate(r));
+    }
+    assert.deepEqual(sent, [20_000, 80_000], "the departure sends the newest checkpoint journaled");
+    await a.player.pause();
+  } finally {
+    answering = true;
+    for (const r of held.splice(0)) r();
+    // Until the journal is all acknowledged: a push left to run then has nothing to send.
+    for (let i = 0; i < 2000 && (await entries(w.db, w.account)).some((x) => !x.receipt); i++) await new Promise((r) => setTimeout(r, 1));
+    globalThis.fetch = realFetch;
+  }
+});
+
 test("continuous playback into an episode the browser cannot play shows that episode with the relay message", async () => {
   const w = await new World().init();
   const e1 = w.episode(1, { queued: true, duration: minute });

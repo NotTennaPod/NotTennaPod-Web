@@ -211,6 +211,46 @@ export async function pushOnce(db: IDBDatabase, account: string, send: Transport
   return out;
 }
 
+/** keepaliveBytes is the most a push sent as the page goes may carry: browsers allow a page's keepalive requests 64 KiB of body in all. */
+export const keepaliveBytes = 60 << 10;
+
+/**
+ * leavingPush is the push a page going away sends with keepalive: the
+ * journal's unsent facts as any push sends them (the same slots, op IDs and
+ * author chain), whole, as many from the front as fit `limit` bytes of body,
+ * in order. Null when there is nothing to send, or a push could not be sent
+ * now (paused, no cursor, or a handoff or a restore's recovery goes first).
+ * The facts stay journaled until a push's answer acknowledges them.
+ */
+export async function leavingPush(db: IDBDatabase, account: string, limit = keepaliveBytes): Promise<Record<string, unknown> | null> {
+  const inst = (await tx(db, ["installations"], "readonly", (t) => req(t.objectStore("installations").get(account)))) as InstallationRow | undefined;
+  if (!inst || !inst.registered || inst.paused || !inst.cursor || inst.successor || (inst.recovery && !inst.recovery.finished)) return null;
+  const pending = (await unacknowledged(db, account)).filter((e) => e.install_id === inst.install_id && e.install_seq > inst.acked_install_seq);
+  const bodyOf = (sent: EntryRow[]) => {
+    const body: Record<string, unknown> = {
+      cursor: inst.cursor,
+      install_id: inst.install_id,
+      acked_install_seq: inst.acked_install_seq,
+      operations: sent.map((e) => ({ install_seq: e.install_seq, fact: e.fact })),
+    };
+    const secrets = sent.flatMap((e) => e.secrets ?? []);
+    if (secrets.length) body.secrets = secrets;
+    return body;
+  };
+  const size = (v: unknown) => utf8(JSON.stringify(v)).length;
+  // Counted generously (a comma for each, the secrets' member), then checked exactly.
+  let bytes = size(bodyOf([])) + 14;
+  let n = 0;
+  for (const e of pending) {
+    if (n >= defaultBounds.max_operations) break;
+    bytes += size({ install_seq: e.install_seq, fact: e.fact }) + 1 + (e.secrets ?? []).reduce((k, x) => k + size(x) + 1, 0);
+    if (bytes > limit) break; // a fact sent in parts never fits: the facts before it go
+    n++;
+  }
+  while (n > 0 && size(bodyOf(pending.slice(0, n))) > limit) n--;
+  return n > 0 ? bodyOf(pending.slice(0, n)) : null;
+}
+
 /** pushAll pushes until nothing more can be pushed now. */
 export async function pushAll(db: IDBDatabase, account: string, send: Transport, bounds: Bounds = defaultBounds): Promise<PushOutcome> {
   let last: PushOutcome = { acknowledged: 0, remaining: 0, waiting: null, stopped: null };

@@ -14,7 +14,7 @@ import { ShowNotes } from "../shownotes/ShowNotes.tsx";
 
 export function Episode({ id }: { id: string }) {
   const sync = useSync();
-  const view = useView((signal) => reads.episode(id, signal), [id]);
+  const view = useView((signal) => reads.episode(id, signal), [id], { entity: true });
   const e = view.data?.episode;
   if (!e) return view.error ? <p class="error">{view.error}</p> : <Loading />;
   const description = (e.metadata as { description?: string | null } | undefined)?.description ?? "";

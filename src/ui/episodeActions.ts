@@ -172,7 +172,7 @@ export function actionsFor(sync: Sync, e: EpisodeRow, where?: "history" | "queue
   const out: EpisodeAction[] = [];
   if (e.has_media) out.push({ label: playLabel(sync, e.episode_id), run: () => play(sync, e) });
   if (e.in_queue) out.push({ label: "remove_from_queue_label", run: () => dequeue(sync, [e]) });
-  else out.push({ label: "add_to_queue_label", run: () => enqueue(sync, [e]) });
+  else if (e.has_media) out.push({ label: "add_to_queue_label", run: () => enqueue(sync, [e]) });
   if (where === "queue") {
     out.push({ label: "move_to_top_label", run: () => move(sync, e, "top") });
     out.push({ label: "move_to_bottom_label", run: () => move(sync, e, "bottom") });

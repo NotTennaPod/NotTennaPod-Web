@@ -73,7 +73,12 @@ export async function acceptable(sync: Sync, head: Head, shown: Head | undefined
   return !signal.aborted && headAtLeast(head, shown);
 }
 
-export function useView<T extends { head: Head }>(load: (signal: AbortSignal) => Promise<T>, deps: unknown[]): ViewState<T> {
+/**
+ * useView loads a screen's view. `entity`: the screen shows one podcast or
+ * episode, and a 404 means the server no longer has it (removed on another
+ * device): the screen stops showing it. Other screens keep what they show.
+ */
+export function useView<T extends { head: Head }>(load: (signal: AbortSignal) => Promise<T>, deps: unknown[], opts: { entity?: boolean } = {}): ViewState<T> {
   const sync = useSync();
   const [state, setState] = useState<{ data: T | undefined; error: string | undefined; loading: boolean; refreshing: boolean; of: unknown }>({
     data: undefined,
@@ -108,7 +113,8 @@ export function useView<T extends { head: Head }>(load: (signal: AbortSignal) =>
       if (e instanceof Unreachable) sync.connection.set("unreachable");
       else if (!(e instanceof DOMException && e.name === "AbortError")) {
         const message = e instanceof ApiError ? e.message : String(e);
-        setState((s) => (s.of === of ? { ...s, error: message, loading: false, refreshing: false } : { data: undefined, error: message, loading: false, refreshing: false, of }));
+        const gone = opts.entity && e instanceof ApiError && e.status === 404;
+        setState((s) => (s.of === of ? { ...s, ...(gone ? { data: undefined } : {}), error: message, loading: false, refreshing: false } : { data: undefined, error: message, loading: false, refreshing: false, of }));
       }
       return retryable(e);
     },

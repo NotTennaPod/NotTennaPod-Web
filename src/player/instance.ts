@@ -155,10 +155,7 @@ export function startPlayer(sync: Sync): Player {
     // The queue the player places a play's queue add in counts this tab's own earlier changes.
     reads: { episode: (id) => reads.episode(id), queue: async () => (await sync.pushed(), wholeQueue()), summary: () => reads.summary() },
     channel: channel(sync.account),
-    appended: (n) => {
-      sync.pending.set(sync.pending.get() + n);
-      sync.schedule(0);
-    },
+    appended: (n) => sync.journaled(n),
     notify: (text) => sync.notify(text),
     needsRelay: w("needs_relay"),
     unreachable: w("server_unreachable"),
@@ -190,6 +187,11 @@ export function startPlayer(sync: Sync): Player {
     if (e.key === `nottennapod:${sync.account}:playback_speed` && e.newValue) player.setRate(Number(e.newValue) || 1);
   });
   window.addEventListener("pagehide", (e) => player.pageHidden(e.persisted));
+  // Hidden (switched away from, or about to close): the playing position is journaled, and the push
+  // the page sends if it then goes away is prepared from the journal, while the page can still do both.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") void player.hidden().then(() => sync.prepare());
+  });
   void player.boot();
   return player;
 }
@@ -285,10 +287,7 @@ export async function exportBeforeCut(sync: Sync): Promise<string[]> {
   const player = players.get(sync);
   if (player) return player.beforeCut();
   const made = await exportPending(sync.session.db, sync.account, sync.session.author.author_id, Date.now());
-  if (made.length) {
-    sync.pending.set(sync.pending.get() + made.length);
-    sync.schedule(0);
-  }
+  if (made.length) sync.journaled(made.length);
   return [...new Set([...made, ...(await listeningFrontier(sync.session.db, sync.account))])];
 }
 

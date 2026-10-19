@@ -1010,7 +1010,7 @@ export class Player {
    * #save journals a save of the live session; an interval save exports when
    * a minute has passed since the last export, a pause or stop always does.
    */
-  async #save(position: number, why: "interval" | "pause" | "flush"): Promise<void> {
+  async #save(position: number, why: "interval" | "pause" | "flush" | "hidden"): Promise<void> {
     const live = this.#live;
     const cur = this.#current;
     if (!live || !cur) return;
@@ -1018,7 +1018,7 @@ export class Player {
   }
 
   /** #saveTo journals a save of a given session: the one playing when Pause was pressed, even if a transition followed. */
-  async #saveTo(live: SessionRow, cur: Current, position: number, why: "interval" | "pause" | "flush"): Promise<void> {
+  async #saveTo(live: SessionRow, cur: Current, position: number, why: "interval" | "pause" | "flush" | "hidden"): Promise<void> {
     const now = this.#now;
     const duration = this.#d.media.duration;
     const out = await inPlayer(this.#d.db, async (t) => {
@@ -1044,7 +1044,8 @@ export class Player {
     if (!out) return;
     if (this.#live?.session_id === live.session_id) this.#live = out.r;
     cur.lastPlayed = now;
-    if (out.entry) this.#appended(1);
+    // A save on hiding is journaled for the page's departure, not pushed now (Sync.prepare).
+    if (out.entry && why !== "hidden") this.#appended(1);
   }
 
   /** #pauseAndSave pauses a playing session with its final save and export. */
@@ -1365,6 +1366,18 @@ export class Player {
   pageHidden(persisted = false): void {
     if (this.#playing && this.#live) void this.#save(this.#d.media.position, "pause");
     if (!persisted) this.#d.media.unload();
+  }
+
+  /**
+   * hidden journals a checkpoint of the playing position when the page is
+   * hidden, while it can still write: a page then closed has it ready for
+   * its departure's push (Sync.leaving). Playback, and its exports every
+   * minute, go on in the background.
+   */
+  hidden(): Promise<void> {
+    return this.#run(async () => {
+      if (this.#playing && this.#live) await this.#save(this.#d.media.position, "hidden");
+    }) as Promise<void>;
   }
 
   // ---- transitions

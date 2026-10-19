@@ -87,7 +87,7 @@ export function requestStrict<T = Record<string, unknown>>(method: string, path:
   return send<T>(method, path, body, signal, true);
 }
 
-async function send<T>(method: string, path: string, body: unknown, signal: AbortSignal | undefined, strict: boolean): Promise<T> {
+async function send<T>(method: string, path: string, body: unknown, signal: AbortSignal | undefined, strict: boolean, keepalive = false): Promise<T> {
   const started = generation;
   const headers: Record<string, string> = { Accept: "application/json" };
   if (account) headers["X-NotTennaPod-Account"] = account;
@@ -101,6 +101,7 @@ async function send<T>(method: string, path: string, body: unknown, signal: Abor
       credentials: "same-origin",
       cache: "no-store",
       signal,
+      keepalive,
     });
   } catch (e) {
     if (signal?.aborted) throw e;
@@ -130,3 +131,5 @@ async function send<T>(method: string, path: string, body: unknown, signal: Abor
 export const get = <T = Record<string, unknown>>(path: string, q?: Query, signal?: AbortSignal) =>
   request<T>("GET", withQuery(path, q), undefined, signal);
 export const post = <T = Record<string, unknown>>(path: string, body: unknown = {}) => request<T>("POST", path, body);
+/** postKeepalive is a POST that outlives the page (fetch's keepalive), for a page going away: its body must fit the browser's keepalive limit (64 KiB). */
+export const postKeepalive = <T = Record<string, unknown>>(path: string, body: unknown) => send<T>("POST", path, body, undefined, false, true);

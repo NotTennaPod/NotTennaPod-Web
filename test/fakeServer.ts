@@ -11,9 +11,11 @@
 //   superseded installation may only repeat its handoff (to the same
 //   successor), read its session or sign out; other requests get 409
 //   installation_superseded.
+// - Signing out deletes the session's credential and clears the cookie.
 // - A repeat of a registration replaces the successor's earlier credential:
 //   the cookie the first answer gave is revoked (401).
-// - The successor's first use of its credential revokes its predecessor's.
+// - The successor's first use of its credential revokes its predecessor's,
+//   and theirs up the chain of handoffs not yet finished (FinishSupersession).
 
 interface Installation {
   nonce: string;
@@ -62,10 +64,12 @@ export class FakeServer {
     }
     const inst = this.installations.get(cred.install)!;
     const successor = path === "/v1/installations/successor";
-    if (inst.supersededBy && !successor && path !== "/v1/session") return { status: 409, error: "installation_superseded" };
-    if (inst.pendingPredecessor && !successor) {
-      this.#revokeOf(inst.pendingPredecessor);
-      delete inst.pendingPredecessor;
+    if (inst.supersededBy && !successor && path !== "/v1/session" && path !== "/v1/auth/web/sign-out") return { status: 409, error: "installation_superseded" };
+    for (let at = inst; at.pendingPredecessor && !successor; ) {
+      const predecessor = at.pendingPredecessor;
+      this.#revokeOf(predecessor);
+      delete at.pendingPredecessor;
+      at = this.installations.get(predecessor)!;
     }
     return { install: cred.install };
   }
@@ -108,6 +112,9 @@ export class FakeServer {
       status = r.status;
       cookie = r.cookie;
       out = r.error ? { error: r.error, message: r.error } : { install_id: body.install_id };
+    } else if (path === "/v1/auth/web/sign-out") {
+      this.credentials.get(sent!)!.revoked = true;
+      cookie = "";
     } else if (path === "/v1/session") {
       out = {
         account: { account_id: this.account, namespace: "n", username: "u", is_admin: false },
@@ -118,7 +125,7 @@ export class FakeServer {
       out = other(path, body);
     }
     const respond = () => {
-      if (cookie) this.jar = cookie; // Set-Cookie, as the answer arrives
+      if (cookie !== undefined) this.jar = cookie || null; // Set-Cookie (empty: cleared), as the answer arrives
       return new Response(JSON.stringify(out), { status, headers: { "Content-Type": "application/json" } });
     };
     if (!this.hold.has(path)) return Promise.resolve(respond());

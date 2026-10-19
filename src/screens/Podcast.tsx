@@ -30,7 +30,7 @@ const actions: [string, StringKey][] = [
 
 export function Podcast({ id }: { id: string }) {
   const sync = useSync();
-  const view = useView((signal) => reads.podcast(id, signal), [id]);
+  const view = useView((signal) => reads.podcast(id, signal), [id], { entity: true });
   const [order, setOrder] = useLocalSetting(`podcast_sort:${id}`, "date_new_old");
   const list = usePaged((q, s) => reads.podcastEpisodes(id, { ...q, sort: order }, s), [id, order]);
   const [removing, setRemoving] = useState(false);

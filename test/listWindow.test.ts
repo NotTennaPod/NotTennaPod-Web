@@ -1312,3 +1312,44 @@ test("paging on through 100 pages holds at most 400 rows and draws as many, keep
   assert.ok(rowsInDom() <= maxHeldRows, `${rowsInDom()} rows drawn`);
   await unmount();
 });
+
+test("rows Load more let go of above a held selection come back from the selection's view, though a newer head arrived", async () => {
+  scrollY = 0;
+  const server = new ListServer(1000);
+  const sync = await testSync();
+  const { box, unmount } = await mount(server, sync);
+  const view = server.requests[0]!.view;
+  while (loadedTo(box.list) < 500) {
+    // The person scrolls to the end of what is held; Load more comes into sight.
+    const last = box.list.items!.at(-1)!.episode_id;
+    scrollToRow(last, viewport - heightOf(last));
+    await act(() => box.list.loadMore());
+    await act(() => settle());
+  }
+  assert.equal(box.list.window.offset, 100, "Load more let go of the first 100 rows");
+  // A selection holds the list; meanwhile a phone changes a row above, and the head moves on.
+  box.list.window.hold(true);
+  try {
+  server.change(10, "Changed on the phone");
+  await act(async () => {
+    await sync.learn(head(server.seq));
+    await settle();
+  });
+  // Scrolling back up: the spacer's end comes into sight above the first row held.
+  scrollY += topOf("e100")! - 200;
+  server.requests = [];
+  await act(async () => {
+    box.list.window.loadPrevious();
+    await settle();
+  });
+  await until(() => box.list.window.offset < 100, "the rows above come back");
+  assert.ok(win.document.querySelector('[data-id="e99"]'), "the row just above is there");
+  near(topOf("e100"), 200, "the rows on screen stay where they were");
+  assert.ok(server.requests.length > 0 && server.requests.every((q) => q.kind === "token" && q.view === view), "read from the selection's view");
+  assert.equal(win.document.querySelector('[data-id="e10"]')!.textContent, "Episode 10", "the selection's rows, not the newer head's");
+  assert.equal(box.list.data!.head.seq, 1);
+  } finally {
+    box.list.window.hold(false); // its renewal timer stops
+  }
+  await unmount();
+});
